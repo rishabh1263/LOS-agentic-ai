@@ -1,1 +1,0 @@
-DOCUMENT_VERIFY_PERMISSION = "document:verify"

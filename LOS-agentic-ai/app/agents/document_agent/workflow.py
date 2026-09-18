@@ -1598,20 +1598,32 @@ def _process_image(
 # PDF workflow
 # ---------------------------------------------------------------------------
 
-def _render_pdf_page(path: str, number: int):
-    """Rasterise exactly one page."""
+def _render_pdf_page(
+    path: str,
+    number: int,
+):
+    """Rasterise exactly one PDF page using Poppler."""
 
     from pdf2image import convert_from_path
+
+    poppler_dir = r"D:\Application Download\poppler-26.09.0\Library\bin"
+
+    logger.info(
+        "Rendering PDF page=%s path=%s poppler=%s",
+        number,
+        path,
+        poppler_dir,
+    )
 
     pages = convert_from_path(
         path,
         dpi=pdf_render_dpi(),
         first_page=number,
         last_page=number,
+        poppler_path=poppler_dir,
     )
 
     return pages[0] if pages else None
-
 
 def _merge_pages(
     results: list[DocumentExtractionResult],
