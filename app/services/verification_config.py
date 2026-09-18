@@ -34,6 +34,17 @@ def _section() -> dict:
     return _load().get("verification", {}) or {}
 
 
+def scoring_config() -> dict:
+    """
+    Per-document verification scoring weights.
+
+    Empty when unset, which is the normal state: a verifier supplies its own
+    weights and a configuration block only retunes them. Adding a document
+    type to the scoring framework should not require touching code.
+    """
+    return _section().get("scoring", {}) or {}
+
+
 def is_enabled(document_type: str) -> bool:
     """
     Whether verification applies to this document type.

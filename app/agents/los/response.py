@@ -392,6 +392,22 @@ def compact_document(document: dict[str, Any]) -> dict[str, Any]:
     if reasons:
         compact["reason_codes"] = reasons
 
+    # WHY, IN A SENTENCE. A reason code routes a queue; a person still has to
+    # know what to do. A REVIEW that carries neither is a dead end.
+    if verification.get("reasons"):
+        compact["reasons"] = list(verification["reasons"])
+
+    # How much of what should have been established was, and how far that
+    # answer can be relied on. NOT a risk or credit score -- they describe
+    # the document and the checking of it, and no amount of money on a
+    # statement moves either one.
+    for field in ("verification_score", "verification_confidence"):
+        if verification.get(field) is not None:
+            compact[field] = verification[field]
+
+    # Said plainly rather than inferred from whether `extraction` is present.
+    compact["has_extracted_fields"] = bool(compact.get("extraction"))
+
     # WHAT A PASS DOES NOT MEAN, carried in the response rather than only in
     # the documentation. Nothing in this service can establish that an
     # identity document was issued by the authority it names: there is no

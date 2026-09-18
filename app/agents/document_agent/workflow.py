@@ -685,6 +685,7 @@ def _serialise_identity_verification(
 def _serialise_financial_extraction(
     result: FinancialResult,
     include_detail: bool = True,
+    include_signals: bool = True,
 ) -> dict[str, Any]:
     """
     Keep the unified public contract while preserving all financial
@@ -719,6 +720,20 @@ def _serialise_financial_extraction(
         "evidence": result.evidence,
     }
 
+    # INCOME ANALYSIS IS A LATER STAGE'S OUTPUT.
+    #
+    # `signals` carries average monthly credit, net salary and total
+    # credits/debits; `evidence` carries derived aggregates for a risk
+    # engine. Both are financial ANALYSIS, and a FOS response must not
+    # contain them -- the FOS stage verifies that a statement is a readable,
+    # coherent document, and has no authority to say anything about income.
+    #
+    # The credit stage asks for them by leaving this on, which is the
+    # default, so /api/v1/los/process is unchanged.
+    if not include_signals:
+        explicit.pop("signals", None)
+        explicit.pop("evidence", None)
+
     for key, value in explicit.items():
         if value is not None:
             fields[key] = value
@@ -736,25 +751,74 @@ def _serialise_financial_extraction(
 def _serialise_financial_verification(
     result: FinancialResult,
 ) -> dict[str, Any]:
-    status = "REVIEW"
+    """
+    The financial verdict, WITH ITS REASONS.
 
-    if result.verified is True:
-        status = "PASS"
-    elif result.verified is False:
-        status = "FAIL"
+    This used to return a status and a `checks` dict and nothing else -- no
+    reason codes at all, because the key did not exist on this path. Every
+    bank statement that did not pass therefore came back as:
 
-    checks: dict[str, Any] = {
-        "financial_integrity": status,
-    }
+        verification: REVIEW
+        reason_codes: []
 
-    if result.verification_note:
-        checks["note"] = (
-            result.verification_note
-        )
+    A field officer was told a document needed review and nothing about what
+    to do with it. The verdict was usually right; it was simply unexplained,
+    and an unexplained REVIEW is one nobody can act on or appeal.
 
+    The verdict itself is unchanged where the evidence is conclusive: a
+    reconciliation that demonstrably fails is still a hard gate to FAIL. What
+    changed is that an INCONCLUSIVE result now says so, in a sentence a field
+    officer can read, with a code a queue can route on.
+    """
+    from app.agents.verification import scoring
+
+    # Fall back to the original mapping when a verifier supplied no evidence
+    # -- ITR and salary slips do not yet, and must keep working exactly as
+    # they did.
+    if not result.verification_checks:
+        status = "REVIEW"
+        if result.verified is True:
+            status = "PASS"
+        elif result.verified is False:
+            status = "FAIL"
+
+        checks: dict[str, Any] = {"financial_integrity": status}
+        if result.verification_note:
+            checks["note"] = result.verification_note
+
+        payload: dict[str, Any] = {"status": status, "checks": checks}
+        if status != "PASS":
+            payload["reason_codes"] = ["VERIFICATION_INCONCLUSIVE"]
+            payload["reasons"] = [
+                "This document needs review because its verification could "
+                "not be completed."
+            ]
+        return payload
+
+    assessment = scoring.assess(
+        "BANK_STATEMENT",
+        [
+            scoring.Check(
+                name=c.get("name", ""),
+                outcome=c.get("outcome", scoring.Outcome.UNKNOWN),
+                weight=float(c.get("weight", 1.0)),
+                reason_code=c.get("reason_code"),
+                reason=c.get("reason"),
+                hard_gate=bool(c.get("hard_gate")),
+                gate_verdict=c.get("gate_verdict", scoring.FAIL),
+            )
+            for c in result.verification_checks
+        ],
+    )
+
+    published = assessment.public()
     return {
-        "status": status,
-        "checks": checks,
+        "status": assessment.status,
+        "checks": {"financial_integrity": assessment.status},
+        "verification_score": published["verification_score"],
+        "verification_confidence": published["verification_confidence"],
+        "reason_codes": published["reason_codes"],
+        "reasons": published["reasons"],
     }
 
 
@@ -869,6 +933,7 @@ def _financial_response(
     ocr_confidence: float,
     timings: "Timings | None" = None,
     include_detail: bool = True,
+    include_signals: bool = True,
     requested_class: str | None = None,
 ) -> dict[str, Any]:
     """
@@ -919,7 +984,9 @@ def _financial_response(
 
     if operation == "EXTRACT" and verification["status"] == "PASS":
         extraction = _serialise_financial_extraction(
-            financial_result, include_detail=include_detail
+            financial_result,
+            include_detail=include_detail,
+            include_signals=include_signals,
         )
 
     return _envelope(
@@ -1262,6 +1329,7 @@ async def process_document(
     requested_class: str | None = None,
     request_id: str,
     include_detail: bool = True,
+    include_signals: bool = True,
 ) -> dict[str, Any]:
     """
     Main unified Document Agent workflow.
@@ -1320,6 +1388,7 @@ async def process_document(
         requested_class,
         request_id,
         include_detail,
+        include_signals,
     )
 
 
@@ -1330,6 +1399,7 @@ def _process_document_sync(
     requested_class: str | None,
     request_id: str,
     include_detail: bool = True,
+    include_signals: bool = True,
 ) -> dict[str, Any]:
     """Blocking body of the workflow. Runs on the document executor."""
 
@@ -1355,6 +1425,7 @@ def _process_document_sync(
                 request_id=request_id,
                 timings=timings,
                 include_detail=include_detail,
+                include_signals=include_signals,
             )
 
         finally:
@@ -1395,6 +1466,7 @@ def _process_document_sync(
         request_id=request_id,
         timings=timings,
         include_detail=include_detail,
+        include_signals=include_signals,
     )
 
 
@@ -1420,6 +1492,7 @@ def _process_image(
     request_id: str,
     timings: "Timings | None" = None,
     include_detail: bool = True,
+    include_signals: bool = True,
 ) -> dict[str, Any]:
     """Route a single image, escalating OCR only when a pass falls short."""
 
@@ -1482,6 +1555,7 @@ def _process_image(
                 ocr_confidence=ocr_confidence,
                 timings=timings,
                 include_detail=include_detail,
+                include_signals=include_signals,
             )
 
         finally:
@@ -1572,6 +1646,7 @@ def _process_pdf(
     request_id: str,
     timings: "Timings | None" = None,
     include_detail: bool = True,
+    include_signals: bool = True,
 ) -> dict[str, Any]:
     """
     Process a PDF through the unified document workflow.
@@ -1632,6 +1707,7 @@ def _process_pdf(
                 ocr_confidence=0.0,
                 timings=timings,
                 include_detail=include_detail,
+                include_signals=include_signals,
             )
 
         # ------------------------------------------------------------------
@@ -1758,6 +1834,7 @@ def _process_pdf(
                             ),
                             timings=timings,
                             include_detail=include_detail,
+                include_signals=include_signals,
                         )
 
                     if page_class is not DocumentClass.UNKNOWN:
@@ -1822,6 +1899,7 @@ def _process_pdf(
                     ),
                     timings=timings,
                     include_detail=include_detail,
+                include_signals=include_signals,
                 )
 
         # ------------------------------------------------------------------

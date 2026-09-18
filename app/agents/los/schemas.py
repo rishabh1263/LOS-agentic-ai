@@ -142,6 +142,41 @@ class ProcessedDocument(BaseModel):
     reason_codes: list[str] | None = Field(
         None, description="Why this verdict. Absent when there is nothing to say."
     )
+    verification_score: int | None = Field(
+        None, ge=0, le=100,
+        description=(
+            "How much of what should have been established about this "
+            "document was. NOT a risk or credit score: it describes the "
+            "document and the checking of it, and no figure on a bank "
+            "statement moves it."
+        ),
+        examples=[91],
+    )
+    verification_confidence: int | None = Field(
+        None, ge=0, le=100,
+        description=(
+            "How far `verification_score` can be relied on -- the share of "
+            "checks that reached a conclusion either way. "
+            "A document that plainly fails every check scores 0 with HIGH "
+            "confidence. One whose checks could not run scores 0 with LOW "
+            "confidence. Those are very different situations and one number "
+            "cannot say both."
+        ),
+        examples=[94],
+    )
+    reasons: list[str] | None = Field(
+        None,
+        description=(
+            "Plain-language explanation for a REVIEW or FAIL, one per reason "
+            "code. Absent on a pass."
+        ),
+        examples=[["This bank statement needs review because its transaction "
+                   "integrity could not be established confidently."]],
+    )
+    has_extracted_fields: bool | None = Field(
+        None,
+        description="Whether the verification gate released any fields.",
+    )
     authenticity: str | None = Field(
         None,
         description=AUTHENTICITY_DESCRIPTION,

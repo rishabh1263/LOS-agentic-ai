@@ -859,6 +859,11 @@ async def _copilot_upload(
         # name -- and returned it from an upload endpoint at a stage with no
         # authority to act on it.
         cross_document_checks=False,
+        # And no income analysis. A bank statement is verified here as a
+        # DOCUMENT; `signals` carries average monthly credit and net salary,
+        # which is the credit stage's output and has no business in a FOS
+        # response. /api/v1/los/process leaves this on.
+        financial_analysis=False,
         # And no application summary: FOS writes its own answer from these
         # results and never reads `summary`, so generating one is a model
         # call per upload that nobody sees.

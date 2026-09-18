@@ -103,6 +103,29 @@ def classify_financial(path: str) -> tuple[FinancialDocumentType, float]:
     return best, round(confidence, 4)
 
 
+def _bank_statement_checks(raw) -> list[dict] | None:
+    """
+    Named checks for the shared scoring layer. Never raises.
+
+    A failure to describe the evidence must not fail the upload -- the
+    verdict is already decided; this only explains it.
+    """
+    try:
+        from app.agents.verification.bank_statement_checks import checks_for
+
+        return [
+            {
+                "name": c.name, "outcome": c.outcome, "weight": c.weight,
+                "reason_code": c.reason_code, "reason": c.reason,
+                "hard_gate": c.hard_gate, "gate_verdict": c.gate_verdict,
+            }
+            for c in checks_for(raw)
+        ]
+    except Exception:
+        logger.exception("bank statement checks could not be built")
+        return None
+
+
 def _from_bank_statement(path: str) -> FinancialResult:
     from app.agents.bank_statement import extract_bank_statement
 
@@ -154,6 +177,9 @@ def _from_bank_statement(path: str) -> FinancialResult:
         ),
         verified=raw.balance_reconciles,
         verification_note=note,
+        # The evidence behind the verdict, so the workflow can explain a
+        # REVIEW instead of returning one with an empty reason list.
+        verification_checks=_bank_statement_checks(raw),
         detail=detail,
         processing_ms=raw.processing_ms,
         confidence=1.0 if raw.balance_reconciles else 0.0,

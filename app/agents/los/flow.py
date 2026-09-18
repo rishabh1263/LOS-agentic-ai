@@ -425,6 +425,8 @@ async def _process_one(
     document: UploadedDocument,
     operation: str,
     request_id: str,
+    *,
+    financial_analysis: bool = True,
 ) -> dict[str, Any]:
     """Run one upload through the Document Agent, never raising."""
     # Classification switched off.
@@ -458,6 +460,7 @@ async def _process_one(
             requested_class=document.expected_type,
             request_id=f"{request_id}:{document.source_id}",
             include_detail=False,
+            include_signals=financial_analysis,
         )
     except ValueError as exc:
         # Rejected input (bad type, empty, oversized). One bad file must not
@@ -585,6 +588,7 @@ async def process_application(
     use_llm_summary: bool | None = None,
     cross_document_checks: bool = True,
     summarise: bool = True,
+    financial_analysis: bool = True,
 ) -> dict[str, Any]:
     """
     Run every document, cross-check them, and return one response.
@@ -628,7 +632,9 @@ async def process_application(
 
     # Independent work, run together.
     documents = await asyncio.gather(
-        *(_process_one(upload, operation, request_id) for upload in uploads)
+        *(_process_one(upload, operation, request_id,
+                       financial_analysis=financial_analysis)
+          for upload in uploads)
     )
 
     # ---------------------------------------------------------------

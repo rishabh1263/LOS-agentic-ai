@@ -83,6 +83,13 @@ class FinancialResult(BaseModel):
     # balance reconciliation; for an ITR it is the acknowledgement checks.
     # None means it could not be established, which is not the same as False.
     verified: bool | None = None
+
+    #: Named verification checks, for the shared scoring layer.
+    #:
+    #: INTERNAL. Never published: these describe how the document was
+    #: checked, and the caller is given the score, the confidence and the
+    #: reason codes derived from them instead.
+    verification_checks: list[dict] | None = None
     verification_note: str | None = None
 
     # The full document-specific result, unchanged.
