@@ -1,14 +1,14 @@
-import { ChevronDown } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
+import { ChevronDown } from 'lucide-react'
+import { AnimatePresence, motion } from 'motion/react'
 
 export interface CaseDetailsSectionProps {
-  applicantId: string;
-  setApplicantId: (val: string) => void;
-  caseId: string;
-  setCaseId: (val: string) => void;
-  loading: boolean;
-  isOpen: boolean;
-  onToggle: () => void;
+  applicantId: string
+  setApplicantId: (val: string) => void
+  caseId: string
+  setCaseId: (val: string) => void
+  loading: boolean
+  isOpen: boolean
+  onToggle: () => void
 }
 
 export function CaseDetailsSection({
@@ -36,10 +36,7 @@ export function CaseDetailsSection({
             1
           </span>
           <div>
-            <h2
-              id="section-case"
-              className="font-display text-[16px] font-semibold text-content"
-            >
+            <h2 id="section-case" className="font-display text-[16px] font-semibold text-content">
               Case details
             </h2>
             <p className="font-sans text-[12px] text-content-secondary">
@@ -49,12 +46,12 @@ export function CaseDetailsSection({
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[12px] font-medium text-content-secondary hidden sm:inline">
-            {isOpen ? "Collapse" : "Expand"}
+            {isOpen ? 'Collapse' : 'Expand'}
           </span>
           <div className="flex h-7 w-7 items-center justify-center rounded-xs bg-raised text-icon-default transition-colors hover:bg-raised-hover">
             <ChevronDown
               className={`h-4 w-4 transition-transform duration-200 ${
-                isOpen ? "rotate-180" : ""
+                isOpen ? 'rotate-180' : ''
               }`}
               aria-hidden="true"
             />
@@ -66,9 +63,9 @@ export function CaseDetailsSection({
         {isOpen && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
+            animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeInOut" }}
+            transition={{ duration: 0.2, ease: 'easeInOut' }}
             className="overflow-hidden"
           >
             <div className="grid gap-3.5 sm:grid-cols-2 pt-4 border-t border-line-divider mt-4">
@@ -107,5 +104,5 @@ export function CaseDetailsSection({
         )}
       </AnimatePresence>
     </section>
-  );
+  )
 }
