@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState } from 'react'
 import {
   AlertCircle,
   Check,
@@ -11,25 +11,25 @@ import {
   ShieldAlert,
   ShieldCheck,
   X,
-} from "lucide-react";
-import type { LosProcessResponse } from "../../../runtime/api-tester";
-import { CrossDocumentReconciliation } from "./CrossDocumentReconciliation";
-import { DocumentResultCard } from "./DocumentResultCard";
-import { ValidationSummaryCards } from "./ValidationSummaryCards";
+} from 'lucide-react'
+import type { LosProcessResponse } from '../../../runtime/api-tester'
+import { CrossDocumentReconciliation } from './CrossDocumentReconciliation'
+import { DocumentResultCard } from './DocumentResultCard'
+import { ValidationSummaryCards } from './ValidationSummaryCards'
 
 export interface ResultsPanelProps {
-  result: LosProcessResponse;
-  onReset: () => void;
+  result: LosProcessResponse
+  onReset: () => void
 }
 
 function CopyableBadge({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState(false)
 
   const copy = () => {
-    navigator.clipboard?.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1800);
-  };
+    navigator.clipboard?.writeText(value)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1800)
+  }
 
   return (
     <button
@@ -46,40 +46,39 @@ function CopyableBadge({ label, value }: { label: string; value: string }) {
         <Copy className="h-3.5 w-3.5 text-content-disabled" />
       )}
     </button>
-  );
+  )
 }
 
 export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
-  const [activeTab, setActiveTab] = useState<"all" | string>("all");
+  const [activeTab, setActiveTab] = useState<'all' | string>('all')
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(
     () => new Set(result.documents.map((d) => d.source_id)),
-  );
-  const [showJsonModal, setShowJsonModal] = useState(false);
-  const [copiedJson, setCopiedJson] = useState(false);
+  )
+  const [showJsonModal, setShowJsonModal] = useState(false)
+  const [copiedJson, setCopiedJson] = useState(false)
 
   const toggleDoc = (id: string) => {
     setExpandedDocIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
   const handleCopyJson = () => {
-    navigator.clipboard?.writeText(JSON.stringify(result, null, 2));
-    setCopiedJson(true);
-    setTimeout(() => setCopiedJson(false), 2000);
-  };
+    navigator.clipboard?.writeText(JSON.stringify(result, null, 2))
+    setCopiedJson(true)
+    setTimeout(() => setCopiedJson(false), 2000)
+  }
 
-  const isSuccess = result.status === "SUCCESS" && result.decision === "PASS";
-  const isReject = result.decision === "REJECT";
-  const isReview = result.decision === "REVIEW";
+  const isSuccess = result.status === 'SUCCESS' && result.decision === 'PASS'
+  const isReject = result.decision === 'REJECT'
 
   const filteredDocs =
-    activeTab === "all"
+    activeTab === 'all'
       ? result.documents
-      : result.documents.filter((d) => d.source_id === activeTab);
+      : result.documents.filter((d) => d.source_id === activeTab)
 
   return (
     <div className="space-y-6">
@@ -91,10 +90,10 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
               <span
                 className={`inline-flex items-center gap-1.5 rounded-xs px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider ${
                   isSuccess
-                    ? "bg-success-subtle text-success-text border border-success/30"
+                    ? 'bg-success-subtle text-success-text border border-success/30'
                     : isReject
-                      ? "bg-danger-subtle text-danger-text border border-danger/30"
-                      : "bg-warning-subtle text-warning-text border border-warning/30"
+                    ? 'bg-danger-subtle text-danger-text border border-danger/30'
+                    : 'bg-warning-subtle text-warning-text border border-warning/30'
                 }`}
               >
                 {isSuccess ? (
@@ -105,13 +104,8 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
                   <ShieldCheck className="h-3.5 w-3.5" />
                 )}
                 <span>
-                  {isSuccess
-                    ? "Verification Passed"
-                    : isReject
-                      ? "Verification Rejected"
-                      : "Manual Review Required"}
-                  {" · "}
-                  {result.status}
+                  {isSuccess ? 'Verification Passed' : isReject ? 'Verification Rejected' : 'Manual Review Required'}
+                  {' · '}{result.status}
                 </span>
               </span>
               <span className="chip text-[11px] font-semibold">
@@ -161,6 +155,7 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
           </div>
         </div>
 
+
         {/* Copyable Identifiers */}
         <div className="flex flex-wrap items-center gap-2 pt-1">
           <CopyableBadge label="Request ID" value={result.request_id} />
@@ -195,6 +190,7 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
       <CrossDocumentReconciliation
         crossDocument={result.cross_document}
         documents={result.documents}
+        kyc={result.kyc}
       />
 
       {/* 3. Document Attributes Profile with Filter Tabs */}
@@ -212,11 +208,11 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
             <div className="flex items-center gap-1 rounded-sm bg-raised p-1 border border-line min-w-max">
               <button
                 type="button"
-                onClick={() => setActiveTab("all")}
+                onClick={() => setActiveTab('all')}
                 className={`rounded-xs px-2.5 py-1 text-[11px] font-semibold transition-colors whitespace-nowrap ${
-                  activeTab === "all"
-                    ? "bg-surface text-content shadow-xs border border-line/60"
-                    : "text-content-secondary hover:text-content"
+                  activeTab === 'all'
+                    ? 'bg-surface text-content shadow-xs border border-line/60'
+                    : 'text-content-secondary hover:text-content'
                 }`}
               >
                 All ({result.documents.length})
@@ -228,8 +224,8 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
                   onClick={() => setActiveTab(doc.source_id)}
                   className={`rounded-xs px-2.5 py-1 text-[11px] font-semibold font-mono transition-colors whitespace-nowrap max-w-[160px] truncate ${
                     activeTab === doc.source_id
-                      ? "bg-surface text-content shadow-xs border border-line/60"
-                      : "text-content-secondary hover:text-content"
+                      ? 'bg-surface text-content shadow-xs border border-line/60'
+                      : 'text-content-secondary hover:text-content'
                   }`}
                 >
                   {doc.source_id}
@@ -323,5 +319,5 @@ export function ResultsPanel({ result, onReset }: ResultsPanelProps) {
         </div>
       )}
     </div>
-  );
+  )
 }

@@ -72,11 +72,34 @@ export interface DocumentResult {
   specialist?: SpecialistResult | null
   evidence_refs?: Array<{ source_id: string; locator: string }>
   errors?: LosError[]
+  has_extracted_fields?: boolean
+  authenticity?: string
+  advisories?: string[]
+}
+
+export interface KycFieldSource {
+  source_id: string
+  document_type: string
+  value: string | Record<string, unknown>
+  normalized_value?: string | Record<string, unknown>
+}
+
+export interface KycField {
+  field: string
+  status: CheckStatus
+  match_score: number
+  confidence: number
+  reason_code?: string
+  reason?: string
+  sources?: KycFieldSource[]
 }
 
 export interface KycResult {
   status: CheckStatus
   reason_codes?: string[]
+  overall_score?: number
+  overall_confidence?: number
+  fields?: KycField[]
 }
 
 export interface CrossCheck {

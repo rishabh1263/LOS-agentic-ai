@@ -1,21 +1,21 @@
-import { ChevronDown, SlidersHorizontal } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
-import type { Operation } from "../../../runtime/api-tester";
-import { useAuth } from "../../../runtime/auth";
+import { ChevronDown, SlidersHorizontal } from 'lucide-react'
+import { AnimatePresence, motion } from 'motion/react'
+import type { Operation } from '../../../runtime/api-tester'
+import { useAuth } from '../../../runtime/auth'
 
 export interface AuthSectionProps {
-  token?: string;
-  setToken?: (val: string) => void;
-  operation: Operation;
-  setOperation: (val: Operation) => void;
-  baseUrl: string;
-  setBaseUrl: (val: string) => void;
-  showAdvanced: boolean;
-  setShowAdvanced: (val: boolean | ((prev: boolean) => boolean)) => void;
-  loading: boolean;
-  error?: string | null;
-  isOpen: boolean;
-  onToggle: () => void;
+  token?: string
+  setToken?: (val: string) => void
+  operation: Operation
+  setOperation: (val: Operation) => void
+  baseUrl: string
+  setBaseUrl: (val: string) => void
+  showAdvanced: boolean
+  setShowAdvanced: (val: boolean | ((prev: boolean) => boolean)) => void
+  loading: boolean
+  error?: string | null
+  isOpen: boolean
+  onToggle: () => void
 }
 
 export function AuthSection({
@@ -27,7 +27,7 @@ export function AuthSection({
   isOpen,
   onToggle,
 }: AuthSectionProps) {
-  const { user } = useAuth();
+  const { user } = useAuth()
 
   return (
     <section aria-labelledby="section-auth" className="card overflow-hidden">
@@ -45,28 +45,22 @@ export function AuthSection({
             3
           </span>
           <div>
-            <h2
-              id="section-auth"
-              className="font-display text-[16px] font-semibold text-content"
-            >
+            <h2 id="section-auth" className="font-display text-[16px] font-semibold text-content">
               API configuration
             </h2>
             <p className="font-sans text-[12px] text-content-secondary">
-              {user
-                ? `Authenticated as ${user.username}`
-                : "Ready for live requests"}
+              {user ? `Authenticated as ${user.username}` : 'Ready for live requests'}
             </p>
           </div>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[12px] font-medium text-content-secondary hidden sm:inline">
-            {isOpen ? "Collapse" : "Expand"}
+            {isOpen ? 'Collapse' : 'Expand'}
           </span>
           <div className="flex h-7 w-7 items-center justify-center rounded-xs bg-raised text-icon-default transition-colors hover:bg-raised-hover">
             <ChevronDown
-              className={`h-4 w-4 transition-transform duration-200 ${
-                isOpen ? "rotate-180" : ""
-              }`}
+              className={`h-4 w-4 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''
+                }`}
               aria-hidden="true"
             />
           </div>
@@ -77,9 +71,9 @@ export function AuthSection({
         {isOpen && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
+            animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2, ease: "easeInOut" }}
+            transition={{ duration: 0.2, ease: 'easeInOut' }}
             className="overflow-hidden"
           >
             <div className="space-y-3.5 pt-4 border-t border-line-divider mt-4">
@@ -95,9 +89,8 @@ export function AuthSection({
                   Advanced API options
                 </span>
                 <ChevronDown
-                  className={`h-4 w-4 text-content-disabled transition-transform duration-200 ${
-                    showAdvanced ? "rotate-180" : ""
-                  }`}
+                  className={`h-4 w-4 text-content-disabled transition-transform duration-200 ${showAdvanced ? 'rotate-180' : ''
+                    }`}
                   aria-hidden="true"
                 />
               </button>
@@ -106,7 +99,7 @@ export function AuthSection({
                 {showAdvanced && (
                   <motion.div
                     initial={{ height: 0, opacity: 0 }}
-                    animate={{ height: "auto", opacity: 1 }}
+                    animate={{ height: 'auto', opacity: 1 }}
                     exit={{ height: 0, opacity: 0 }}
                     transition={{ duration: 0.18 }}
                     className="overflow-hidden"
@@ -120,17 +113,11 @@ export function AuthSection({
                           id="operation"
                           className="input h-11"
                           value={operation}
-                          onChange={(e) =>
-                            setOperation(e.target.value as Operation)
-                          }
+                          onChange={(e) => setOperation(e.target.value as Operation)}
                           disabled={loading}
                         >
-                          <option value="PROCESS">
-                            PROCESS — full pipeline
-                          </option>
-                          <option value="EXTRACT">
-                            EXTRACT — same as PROCESS
-                          </option>
+                          <option value="PROCESS">PROCESS — full pipeline</option>
+                          <option value="EXTRACT">EXTRACT — same as PROCESS</option>
                           <option value="VERIFY">VERIFY — no extraction</option>
                         </select>
                       </div>
@@ -143,5 +130,5 @@ export function AuthSection({
         )}
       </AnimatePresence>
     </section>
-  );
+  )
 }

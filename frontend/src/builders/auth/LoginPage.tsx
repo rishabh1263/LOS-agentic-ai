@@ -1,57 +1,49 @@
-import React, { useState } from "react";
-import {
-  AlertCircle,
-  Eye,
-  EyeOff,
-  KeyRound,
-  Loader2,
-  Lock,
-  User,
-} from "lucide-react";
-import { useAuth, AuthApiError } from "../../runtime/auth";
+import React, { useState } from 'react'
+import { AlertCircle, Eye, EyeOff, KeyRound, Loader2, Lock, User } from 'lucide-react'
+import { useAuth, AuthApiError } from '../../runtime/auth'
 
 export function LoginPage() {
-  const { login, isLoading } = useAuth();
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const { login, isLoading } = useAuth()
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
   const handleFillDemo = () => {
-    setUsername("AniketDev");
-    setPassword("Dev@123");
-    setErrorMessage(null);
-  };
+    setUsername('AniketDev')
+    setPassword('Dev@123')
+    setErrorMessage(null)
+  }
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setErrorMessage(null);
+    e.preventDefault()
+    setErrorMessage(null)
 
-    const trimmedUsername = username.trim();
+    const trimmedUsername = username.trim()
     if (!trimmedUsername) {
-      setErrorMessage("Please enter your username.");
-      return;
+      setErrorMessage('Please enter your username.')
+      return
     }
     if (!password) {
-      setErrorMessage("Please enter your password.");
-      return;
+      setErrorMessage('Please enter your password.')
+      return
     }
 
     try {
       await login({
         username: trimmedUsername,
         password,
-      });
+      })
     } catch (err) {
       if (err instanceof AuthApiError) {
-        setErrorMessage(err.detail);
+        setErrorMessage(err.detail)
       } else if (err instanceof Error) {
-        setErrorMessage(err.message);
+        setErrorMessage(err.message)
       } else {
-        setErrorMessage("Failed to log in. Please try again.");
+        setErrorMessage('Failed to log in. Please try again.')
       }
     }
-  };
+  }
 
   return (
     <div className="flex min-h-[calc(100vh-5rem)] items-center justify-center py-10 px-4 sm:px-6">
@@ -72,10 +64,7 @@ export function LoginPage() {
 
             {/* Username Field */}
             <div>
-              <label
-                htmlFor="login-username"
-                className="label flex items-center justify-between"
-              >
+              <label htmlFor="login-username" className="label flex items-center justify-between">
                 <span>Username</span>
               </label>
               <div className="relative">
@@ -100,10 +89,7 @@ export function LoginPage() {
 
             {/* Password Field */}
             <div>
-              <label
-                htmlFor="login-password"
-                className="label flex items-center justify-between"
-              >
+              <label htmlFor="login-password" className="label flex items-center justify-between">
                 <span>Password</span>
               </label>
               <div className="relative">
@@ -113,7 +99,7 @@ export function LoginPage() {
                 <input
                   id="login-password"
                   name="password"
-                  type={showPassword ? "text" : "password"}
+                  type={showPassword ? 'text' : 'password'}
                   autoComplete="current-password"
                   required
                   disabled={isLoading}
@@ -126,7 +112,7 @@ export function LoginPage() {
                   type="button"
                   onClick={() => setShowPassword((prev) => !prev)}
                   tabIndex={-1}
-                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
                   className="absolute inset-y-0 right-0 flex items-center pr-3 text-content-secondary hover:text-content transition-colors focus:outline-none"
                 >
                   {showPassword ? (
@@ -188,5 +174,5 @@ export function LoginPage() {
         </div>
       </div>
     </div>
-  );
+  )
 }

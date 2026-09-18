@@ -1,17 +1,17 @@
-import { ChevronDown, FileText } from "lucide-react";
-import { AnimatePresence, motion } from "motion/react";
-import type { DocumentResult } from "../../../runtime/api-tester";
-import { docStatusClass, verificationClass } from "../../../runtime/api-tester";
-import { StatusChip } from "./StatusChip";
+import { ChevronDown, FileText } from 'lucide-react'
+import { AnimatePresence, motion } from 'motion/react'
+import type { DocumentResult } from '../../../runtime/api-tester'
+import { docStatusClass, verificationClass } from '../../../runtime/api-tester'
+import { StatusChip } from './StatusChip'
 
 export interface DocumentResultCardProps {
-  doc: DocumentResult;
-  isOpen: boolean;
-  onToggle: () => void;
+  doc: DocumentResult
+  isOpen: boolean
+  onToggle: () => void
 }
 
 function renderValue(val: unknown) {
-  if (val == null) return "—";
+  if (val == null) return '—'
   if (Array.isArray(val)) {
     return (
       <div className="flex flex-wrap gap-1">
@@ -21,22 +21,14 @@ function renderValue(val: unknown) {
           </span>
         ))}
       </div>
-    );
+    )
   }
-  return (
-    <span className="font-mono text-[13px] font-medium text-content">
-      {String(val)}
-    </span>
-  );
+  return <span className="font-mono text-[13px] font-medium text-content">{String(val)}</span>
 }
 
-export function DocumentResultCard({
-  doc,
-  isOpen,
-  onToggle,
-}: DocumentResultCardProps) {
-  const extraction = doc.extraction || {};
-  const entries = Object.entries(extraction).filter(([, v]) => v != null);
+export function DocumentResultCard({ doc, isOpen, onToggle }: DocumentResultCardProps) {
+  const extraction = doc.extraction || {}
+  const entries = Object.entries(extraction).filter(([, v]) => v != null)
 
   return (
     <div className="card overflow-hidden border-line bg-surface p-0 shadow-xs">
@@ -67,17 +59,11 @@ export function DocumentResultCard({
         </div>
 
         <div className="flex items-center gap-2 shrink-0">
-          <StatusChip
-            label={doc.status}
-            className={docStatusClass(doc.status)}
-          />
-          <StatusChip
-            label={doc.verification}
-            className={verificationClass(doc.verification)}
-          />
+          <StatusChip label={doc.status} className={docStatusClass(doc.status)} />
+          <StatusChip label={doc.verification} className={verificationClass(doc.verification)} />
           <ChevronDown
             className={`h-4 w-4 text-content-secondary transition-transform duration-200 ${
-              isOpen ? "rotate-180" : ""
+              isOpen ? 'rotate-180' : ''
             }`}
           />
         </div>
@@ -88,7 +74,7 @@ export function DocumentResultCard({
         {isOpen && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
+            animate={{ height: 'auto', opacity: 1 }}
             exit={{ height: 0, opacity: 0 }}
             transition={{ duration: 0.18 }}
             className="overflow-hidden border-t border-line-divider"
@@ -96,20 +82,20 @@ export function DocumentResultCard({
             {entries.length > 0 ? (
               <div className="p-5 grid gap-x-6 gap-y-3 sm:grid-cols-2 bg-raised/20">
                 {entries.map(([k, v]) => {
-                  const isLong = String(v).length > 35;
+                  const isLong = String(v).length > 35
                   return (
                     <div
                       key={k}
                       className={`flex flex-col py-1.5 border-b border-line-divider/60 ${
-                        isLong ? "sm:col-span-2" : ""
+                        isLong ? 'sm:col-span-2' : ''
                       }`}
                     >
                       <span className="font-display text-[10px] font-bold uppercase tracking-wider text-content-secondary">
-                        {k.replace(/_/g, " ")}
+                        {k.replace(/_/g, ' ')}
                       </span>
                       <div className="mt-1">{renderValue(v)}</div>
                     </div>
-                  );
+                  )
                 })}
               </div>
             ) : (
@@ -121,5 +107,5 @@ export function DocumentResultCard({
         )}
       </AnimatePresence>
     </div>
-  );
+  )
 }
