@@ -21,6 +21,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.agents.verification import reasons as reasons_module
+
 # Severity of a failed KYC check, by the check it came from. A mismatch on
 # identity is a different matter from one on address, and a reviewer sorting
 # a queue needs to see which is which.
@@ -109,16 +111,177 @@ def conflicts_from_kyc(kyc: dict[str, Any] | None) -> list[dict[str, Any]]:
 
 
 
+#: Verdicts that owe the caller an explanation.
+#:
+#: SKIPPED is not one of them: a stage that did not run has no finding to
+#: report, and inventing a reason for it would describe a check that never
+#: happened. PASS is not one either -- a clean document annotated with
+#: reason codes reads as a document with problems.
+_NEEDS_A_REASON = {"REVIEW", "FAIL", "REJECTED", "FAILED"}
+
+
 #: What a published KYC field row carries. An allowlist, not a filter: a new
 #: internal key is absent from the response until somebody adds it here and
 #: decides it belongs in front of a customer-facing operator.
 _PUBLIC_FIELD_KEYS = (
     "field", "status", "match_score", "confidence", "reason_code", "reason",
+    # `reason` is dropped below wherever `reason_code` is present; it
+    # stays in the allowlist for the rare row that reaches a verdict
+    # without one, where the sentence is the only explanation there is.
+    # WHOSE ROW THIS IS, on a case-level list covering two parties: two
+    # people produce two NAME rows and a reviewer must be able to tell
+    # them apart. Set only when the case actually has a co-applicant, and
+    # the allowlist drops absent keys -- so a single-applicant response
+    # carries exactly the keys it carried before.
+    "party_id",
 )
 
 #: What a published source carries. `source_id` is the caller's own filename,
 #: echoed back so they can tie a row to the file they sent.
 _PUBLIC_SOURCE_KEYS = ("source_id", "document_type", "value", "normalized_value")
+
+
+# ==========================================================================
+# JSON-NATIVE VALUES
+# ==========================================================================
+
+#: The longest a published extracted value may be before it is treated as
+#: OCR spill rather than a field. A PAN is 10 characters, a name rarely
+#: over 50, a printed address under 150. Past this, what is being
+#: published is the recogniser's output, not a value.
+_MAX_VALUE_CHARS = 160
+
+#: The longest a free-text address component may be. A locality, street
+#: or house number past this is the unplaced remainder of an OCR line,
+#: not a component.
+_MAX_COMPONENT_CHARS = 40
+
+#: Nested keys that restate something the document already says.
+#: `signals.source_document` is "BANK_STATEMENT" on a document whose
+#: `type` is BANK_STATEMENT.
+_REDUNDANT_KEYS = {"source_document"}
+
+#: Any string carrying one of these is a Python repr that escaped, not a
+#: value anybody meant to publish.
+_REPR_MARKERS = ("Decimal(", "datetime.", "object at 0x", "=None ", "None>")
+
+
+def jsonable(value: Any) -> Any:
+    """
+    One extracted value, in a form JSON can carry honestly.
+
+    THE DEFECT THIS CLOSES. A Decimal reached the response as the string
+    `"Decimal('55435.71')"`, and an income model as
+    `"monthly_net_salary=None ... average_monthly_credit=Decimal('55435.71')"`.
+    Both are Python reprs: a client cannot parse them, and they publish
+    how this service is built. Numbers go out as numbers.
+    """
+    from datetime import date, datetime
+    from decimal import Decimal
+
+    if isinstance(value, Decimal):
+        # float(), not str(): a client reading JSON wants a number.
+        return float(value)
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float, str)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(v) for v in value]
+    # A model or object. Its repr is internal by definition.
+    return None
+
+
+def _numeric(value: Any) -> Any:
+    """A decimal-looking string as a number, or the value unchanged."""
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return float(text) if "." in text else int(text)
+        except ValueError:
+            return value
+    return value
+
+
+def _is_repr(value: Any) -> bool:
+    return isinstance(value, str) and any(m in value for m in _REPR_MARKERS)
+
+
+def _structured_address(raw: Any) -> dict[str, str] | None:
+    """
+    An address as components, or nothing.
+
+    ONE SHAPER, EVERYWHERE. Delegates to `address_public.public_address`
+    so the same address published on a document and inside a KYC source
+    is the same object. It was not: `value` came back
+    `{"state": "MAHARASHTRA", "house": "514"}` while `normalized_value`
+    beside it carried a pincode too, because the two went through
+    different paths.
+
+    THAT SHAPER IS PUBLIC-ONLY. KYC still parses and compares exactly
+    what it parsed before -- see app/agents/kyc/address.py. Nothing
+    here reaches a score or a verdict.
+    """
+    from app.agents.los.address_public import public_address
+
+    return public_address(raw)
+
+
+def public_extraction_values(
+    fields: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    Extracted fields, in a form a client can actually consume.
+
+    THREE THINGS HAPPEN HERE, and nothing else. No value is invented, no
+    value is corrected, and no verdict is touched -- the gate upstream
+    already decided what may be released at all.
+
+      NUMBERS GO OUT AS NUMBERS. The financial signals arrived as
+      Decimals and as decimal-looking strings; both are published as
+      JSON numbers.
+
+      AN ADDRESS GOES OUT AS COMPONENTS, or not at all.
+
+      OCR SPILL IS DROPPED. A value longer than a field plausibly is, or
+      carrying a Python repr, is the recogniser's output rather than a
+      reading of a field, and an omitted field is more honest than a
+      transcript presented as one.
+    """
+    released: dict[str, Any] = {}
+
+    for name, value in (fields or {}).items():
+        if name == "address":
+            structured = _structured_address(value)
+            if structured:
+                released[name] = structured
+            continue
+
+        cleaned = jsonable(value)
+
+        if isinstance(cleaned, dict):
+            # `signals` and `evidence` on a bank statement: money held as
+            # strings so no precision was lost in transit. A client
+            # wants numbers.
+            cleaned = {k: _numeric(v) for k, v in cleaned.items()
+                       if k not in _REDUNDANT_KEYS}
+            cleaned = {k: v for k, v in cleaned.items() if v is not None}
+            if cleaned:
+                released[name] = cleaned
+            continue
+
+        if cleaned is None or _is_repr(cleaned):
+            continue
+        if isinstance(cleaned, str) and len(cleaned) > _MAX_VALUE_CHARS:
+            continue
+
+        released[name] = cleaned
+
+    return released
 
 
 def public_kyc_fields(kyc: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -138,12 +301,60 @@ def public_kyc_fields(kyc: dict[str, Any] | None) -> list[dict[str, Any]]:
         row = {key: field.get(key) for key in _PUBLIC_FIELD_KEYS
                if field.get(key) is not None}
 
+        # THE CODE ALREADY SAYS IT. `NAME_MISMATCH` beside "Name differs
+        # across PAN and Driving Licence." is the same fact twice, and
+        # the sentence was the single largest thing in a party's KYC
+        # after the sources. Kept only where there is no code to read.
+        if row.get("reason_code"):
+            row.pop("reason", None)
+
+        # AN ADDRESS SOURCE CARRIES THE SAME OCR LINE THE DOCUMENT DID.
+        # Cleaned the same way, or this is a second door out for the
+        # text the extraction shaping just closed.
+        is_address = str(field.get("field") or "").upper() == "ADDRESS"
+
         sources = []
         for source in field.get("sources") or []:
-            sources.append({
-                key: source.get(key) for key in _PUBLIC_SOURCE_KEYS
-                if source.get(key) is not None
-            })
+            published = {}
+            for key in _PUBLIC_SOURCE_KEYS:
+                value = jsonable(source.get(key))
+                if is_address and key in ("value", "normalized_value"):
+                    # ONE ADDRESS OBJECT, NOT TWO SHAPES. `value` and
+                    # `normalized_value` came from different paths and
+                    # disagreed -- `{"state":..., "house":...}` beside
+                    # `{"pincode":..., "state":..., "house":...}` for
+                    # the same address. The canonical shaping IS the
+                    # normalisation, so there is one object and it is
+                    # published as `value`.
+                    if key == "normalized_value":
+                        continue
+                    shaped = _structured_address(value)
+                    if shaped:
+                        published[key] = shaped
+                    continue
+                # A MODEL REPR IS NOT A VALUE. The INCOME row published
+                # `monthly_net_salary=None ... Decimal('55435.71')` --
+                # the income model printed. Omitted rather than tidied:
+                # the number a reviewer wants is already on the
+                # document's own extraction.
+                if value is None or _is_repr(value):
+                    continue
+                if isinstance(value, str) and len(value) > _MAX_VALUE_CHARS:
+                    continue
+                published[key] = value
+
+            # NORMALISATION THAT CHANGED NOTHING IS NOT WORTH SAYING.
+            # `normalized_value` is published beside `value` so a
+            # near-miss can be read correctly -- the difference is
+            # either in the documents or in the normalisation, and only
+            # showing both says which. When they are identical there is
+            # no difference to explain, and on most rows they were
+            # identical.
+            if published.get("normalized_value") == published.get("value"):
+                published.pop("normalized_value", None)
+
+            if published:
+                sources.append(published)
         if sources:
             row["sources"] = sources
 
@@ -358,6 +569,16 @@ def compact_document(document: dict[str, Any]) -> dict[str, Any]:
         "verification": status,
     }
 
+    # WHOSE DOCUMENT THIS IS.
+    #
+    # Carried on every document so a frontend can split a case into its
+    # two parties without guessing from filenames or upload order.
+    # Present only when the flow stamped it, so a response from a caller
+    # that never supplied parties is unchanged.
+    for field_name in ("party_id", "party_role"):
+        if document.get(field_name):
+            compact[field_name] = document[field_name]
+
     # NOT PRESENT, DELIBERATELY: `category` and the per-stage timings.
     #
     # `category` duplicated the capability name on a specialist document and
@@ -374,9 +595,15 @@ def compact_document(document: dict[str, Any]) -> dict[str, Any]:
     # is exactly how it got lost once: the compact path read the fields
     # straight off the document and a specialist REVIEW handed back its
     # extraction anyway. A gate written twice is a gate enforced once.
-    released = _public_extraction(extraction, status)
+    # CLEANED HERE, NOT IN THE GATE. `released_extraction` is shared with
+    # profile matching and KYC, which compare the RAW normalised values;
+    # structuring an address or dropping a long value for them would
+    # change what gets matched. The cleaning belongs on the way out.
+    released = released_extraction(extraction, status)
     if released and released.get("fields"):
-        compact["extraction"] = released["fields"]
+        values = public_extraction_values(released["fields"])
+        if values:
+            compact["extraction"] = values
 
     # A stage that was switched off says so on the document it would have
     # handled. Without this, "extraction is absent" is indistinguishable from
@@ -388,13 +615,38 @@ def compact_document(document: dict[str, Any]) -> dict[str, Any]:
     if status.upper() == "PASS" and not los_config.extraction_enabled():
         withheld.append("EXTRACTION_DISABLED")
 
-    reasons = list(verification.get("reason_codes") or []) + withheld
-    if reasons:
-        compact["reason_codes"] = reasons
+    codes = list(verification.get("reason_codes") or []) + withheld
+
+    # A NON-PASS ALWAYS SAYS SOMETHING.
+    #
+    # Several paths produce a verdict and a code; at least one produced a
+    # verdict and nothing. A REVIEW with an empty `reason_codes` is a dead
+    # end for the officer holding the document and for the queue trying to
+    # route it, and it is invisible in testing because the verdict looks
+    # right. Closed HERE, at the one point every path passes through,
+    # rather than trusting each of them to remember.
+    if not codes and status.upper() in _NEEDS_A_REASON:
+        codes = ["VERIFICATION_INCONCLUSIVE"]
+
+    if codes:
+        compact["reason_codes"] = codes
 
     # WHY, IN A SENTENCE. A reason code routes a queue; a person still has to
     # know what to do. A REVIEW that carries neither is a dead end.
-    if verification.get("reasons"):
+    #
+    # The verifier's own sentences win where it wrote any: it saw the
+    # document and the catalogue did not. Where it wrote none, the
+    # catalogue supplies one per code, so no non-pass reaches a caller as
+    # a bare identifier. Sale deeds carried four codes and no prose at
+    # all; identity documents carried prose only when the image was poor.
+    sentences = reasons_module.explain_all(
+        codes, existing=verification.get("reasons"),
+    )
+    if sentences and status.upper() in _NEEDS_A_REASON:
+        compact["reasons"] = sentences
+    elif verification.get("reasons"):
+        # A PASS may still carry a note the verifier chose to write. It is
+        # not withheld, but nothing is invented for it either.
         compact["reasons"] = list(verification["reasons"])
 
     # How much of what should have been established was, and how far that
@@ -481,6 +733,138 @@ def compact_document(document: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+# ==========================================================================
+# PARTY SECTIONS -- the same results, grouped by whose they are
+# ==========================================================================
+
+#: Verdict -> the counter it increments in a party's summary.
+#:
+#: FAILED and REJECTED are counted together under `failed`: one means the
+#: file could not be processed and the other that it was processed and
+#: refused, and a caller triaging a queue treats both the same way. The
+#: distinction survives untouched on each document's own `verification`.
+_SUMMARY_BUCKETS = {
+    "PASS": "passed",
+    "REVIEW": "review",
+    "FAIL": "failed",
+    "FAILED": "failed",
+    "REJECTED": "failed",
+    "SKIPPED": "skipped",
+}
+
+
+def verification_summary(documents: list[dict[str, Any]]) -> dict[str, int]:
+    """
+    How one party's documents came out, counted.
+
+    DERIVED, NEVER DECIDED. Every number here is a tally of verdicts that
+    verification already reached. Nothing in this function can change a
+    document's outcome, and the counts always sum to `total_documents` --
+    an unrecognised verdict lands in `skipped` rather than vanishing,
+    because a summary that quietly loses a document is worse than one
+    that files it under the wrong heading.
+
+    Counted over the COMPACT documents, which is what the caller sees, so
+    the summary and the list beneath it can never disagree.
+    """
+    summary = {"total_documents": len(documents), "passed": 0,
+               "review": 0, "failed": 0, "skipped": 0}
+
+    for document in documents:
+        verdict = str(document.get("verification") or "SKIPPED").upper()
+        summary[_SUMMARY_BUCKETS.get(verdict, "skipped")] += 1
+
+    return summary
+
+
+def party_section(
+    *,
+    party_id: str,
+    party_role: str,
+    documents: list[dict[str, Any]],
+    profile_match: dict[str, Any] | None = None,
+    kyc: dict[str, Any] | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """
+    One party's slice of the response: whose, what they sent, how it went.
+
+    A REGROUPING, NOT A SECOND RESULT. `documents` are the very same
+    compact dicts published in the top-level `documents[]`, and
+    `profile_match` is the entry Phase 4 already produced. Nothing is
+    recomputed, so the two views cannot drift into disagreeing about the
+    same document.
+
+    `profile_match` appears only when that party had a profile to match.
+    An empty object would read as "we matched and found nothing", which
+    is a different and much stronger claim than "nobody told us who this
+    person is".
+    """
+    section: dict[str, Any] = {
+        "party_id": party_id,
+        "role": party_role,
+        # THIS PARTY'S DOCUMENT AND KYC STATE. Not a decision, and
+        # deliberately not a `next_action`: a party-level CONTINUE beside
+        # a case-level MANUAL_REVIEW would read as permission to proceed,
+        # and there is ONE decision on a loan. `decision` and
+        # `next_action` stay at case level, where they are true.
+        **({"status": status} if status else {}),
+        # REFERENCES, NOT COPIES. The full objects are published once in
+        # the top-level `documents[]`, each already carrying its
+        # `party_id`; repeating them here put every document in the
+        # response twice and made half the payload a second copy that
+        # could only ever agree with the first. `source_id` is the
+        # caller's own filename and the stable handle they sent.
+        "document_ids": [str(d.get("source_id")) for d in documents
+                         if d.get("source_id")],
+        "verification_summary": verification_summary(documents),
+    }
+
+    if profile_match:
+        section["profile_match"] = profile_match
+
+    # THIS PARTY'S OWN CROSS-DOCUMENT KYC -- do their documents describe
+    # one person? Never compared against the other party's documents:
+    # two people disagreeing is what a joint application IS.
+    if kyc:
+        section["kyc"] = public_kyc(kyc)
+
+    return section
+
+
+def public_kyc(kyc: dict[str, Any] | None, *,
+               compact: bool = False) -> dict[str, Any]:
+    """
+    One KYC verdict, as a caller sees it.
+
+    An allowlist, shared by the case-level object and the party sections
+    so the two cannot describe the same result differently. `checks`
+    stays out: the cross-document view already publishes them, and
+    repeating them here would put the same codes in the response twice.
+
+    `compact` drops the field rows. Used for the CASE-LEVEL object on a
+    two-party case, where every row is already published under the party
+    it belongs to -- keeping both put the whole of both parties' KYC in
+    the response twice, and the copy at the top could not say whose row
+    was whose without an extra key. The verdict, the score, the
+    confidence and the reason codes stay, because those are the
+    case-level answer and are not repeated anywhere else.
+    """
+    kyc = kyc or {}
+
+    published = {
+        "status": kyc.get("status", "SKIPPED"),
+        "reason_codes": list(kyc.get("reason_codes") or []),
+        "overall_score": kyc.get("overall_score", 0),
+        "overall_confidence": kyc.get("overall_confidence", 0),
+    }
+
+    if not compact:
+        published["fields"] = public_kyc_fields(kyc)
+
+    return published
+
+
 def public_document(document: dict[str, Any]) -> dict[str, Any]:
     """
     One document, in the client-facing shape.
@@ -512,7 +896,7 @@ def public_document(document: dict[str, Any]) -> dict[str, Any]:
             "status": status,
             "reason_codes": reason_codes,
         },
-        "extraction": _public_extraction(extraction, status),
+        "extraction": _public_detailed_extraction(extraction, status),
         "processing": _public_timings(document),
         "errors": document.get("errors") or [],
     }
@@ -621,15 +1005,17 @@ def _public_evidence_refs(document: dict[str, Any]) -> list[dict[str, Any]]:
     return public
 
 
-def _public_extraction(
+def released_extraction(
     extraction: dict[str, Any] | None,
     verification_status: str,
 ) -> dict[str, Any] | None:
     """
     Extraction, released only behind the verification gate.
 
-    THE ONE PLACE extraction reaches a client, so the gate is enforced here
-    and nowhere else. It was briefly written twice -- once here and once in
+    THE ONE PLACE extracted fields escape the internal envelope, so the
+    gate is enforced here and nowhere else. Public rather than private
+    because profile matching consumes released fields too, and reusing
+    this is the difference between obeying the gate and re-deciding it. It was briefly written twice -- once here and once in
     the compact shape -- and the second copy did not have the gate, so a
     specialist REVIEW handed its fields back anyway. One gate, one place.
 
@@ -658,6 +1044,17 @@ def _public_extraction(
         "status": extraction.get("status") or ("SUCCESS" if fields else "PARTIAL"),
         "fields": fields,
     }
+
+
+def _public_detailed_extraction(
+    extraction: dict[str, Any] | None, status: str,
+) -> dict[str, Any] | None:
+    """The detailed shape's extraction, behind the gate and cleaned."""
+    released = released_extraction(extraction, status)
+    if not released:
+        return None
+    return {**released,
+            "fields": public_extraction_values(released.get("fields"))}
 
 
 def _public_timings(document: dict[str, Any]) -> dict[str, float]:
@@ -706,6 +1103,8 @@ __all__ = [
     "conflicts_from_kyc", "cross_document_from", "decision_from",
     "public_kyc_fields",
     "public_document",
-    "verification_status", "any_document_verified",
+    "verification_status", "any_document_verified", "released_extraction",
+    "party_section", "verification_summary", "public_kyc", "jsonable",
+    "public_extraction_values",
     "NO_VERIFIED_DOCUMENTS", "DOCUMENT_TYPE_MISMATCH",
 ]

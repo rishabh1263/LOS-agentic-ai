@@ -129,13 +129,30 @@ def fact_set(product: str | None = None) -> FactSet:
     except Exception:
         known_types = frozenset()
 
+    # EVERYTHING THE PRODUCT'S POLICY COULD EVER ASK FOR, not only what this
+    # case's checklist resolved to.
+    #
+    # The checklist is amount- and attribute-dependent, so a perfectly
+    # correct answer explaining that a larger loan would also need income
+    # proof named a slot this case did not have, and the grounding
+    # validator threw it away. The vocabulary a term is checked against has
+    # to be the product's, not the case's -- narrowing it does not make the
+    # validator stricter, it makes it wrong.
+    try:
+        from app.agents.policy.engine import vocabulary_for
+
+        policy_slots, policy_types = vocabulary_for(product)
+    except Exception:  # pragma: no cover - configuration failure
+        policy_slots, policy_types = frozenset(), frozenset()
+
     return FactSet(
         product=product,
         required_slots=tuple(required),
         optional_slots=tuple(optional),
         accepts=accepts,
-        known_types=known_types | {t for types in accepts.values() for t in types},
-        known_slots=frozenset(accepts),
+        known_types=(known_types | policy_types
+                     | {t for types in accepts.values() for t in types}),
+        known_slots=frozenset(accepts) | policy_slots,
     )
 
 

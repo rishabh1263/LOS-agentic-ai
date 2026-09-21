@@ -67,6 +67,7 @@ _READ_REQUIREMENT = {
     Intent.DOCUMENTS_REQUIRED: "documents",
     Intent.DOCUMENTS_MISSING: "documents",
     Intent.DOCUMENTS_PENDING: "documents",
+    Intent.POLICY_EXPLANATION: "documents",
     Intent.DOCUMENT_VERIFICATION: "verification",
     Intent.PENDING_ITEMS: "pending_items",
     Intent.NEXT_ACTION: "next_action",

@@ -162,6 +162,28 @@ def checks_for(result: Any) -> list[Check]:
             reason=("The transactions on this statement do not add up to the "
                     "balance it shows."),
         )
+    elif truncated:
+        # INCONCLUSIVE, AND WE KNOW WHY: the parse did not reach the end of
+        # the statement, so there is an unread tail the rows could be
+        # missing from.
+        #
+        # WHY THIS GETS ITS OWN CODE. The gate decides the verdict, and the
+        # scoring layer publishes the deciding gate's code alone -- so
+        # whatever this check says is the ONLY thing the queue sees. Sending
+        # "integrity could not be established" for a statement we simply ran
+        # out of time on routes a service capacity problem to a human
+        # reviewer, who opens the document, finds nothing wrong, and closes
+        # it. The operator action is to raise the budget or queue the
+        # document for a full parse, and only this code says so.
+        integrity = Check(
+            name="integrity", outcome=Outcome.UNKNOWN, weight=3.0,
+            hard_gate=True, gate_verdict="FAIL",
+            reason_code=TIMEOUT,
+            reason=("This bank statement could not be read all the way "
+                    "through within the time allowed, so its transaction "
+                    "integrity could not be established. This is a limit of "
+                    "the service, not a finding about the document."),
+        )
     else:
         # INCONCLUSIVE, which is a different thing entirely. The same gate,
         # but an UNKNOWN on a gate resolves to REVIEW: a check that could not

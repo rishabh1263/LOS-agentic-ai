@@ -5,16 +5,30 @@ configuration, not code, and it can change without a release.
 
 ## Personal loan
 
-Mandatory:
+The personal loan checklist is resolved by the document policy engine from
+`app/config/policies/personal_loan.yaml`, not from a fixed list. Every
+application needs the base documents; a larger loan or a particular
+employment type can add more.
 
-- **PAN** — satisfied by a PAN card
-- **BANK_STATEMENT** — satisfied by a bank statement
-- **ADDRESS_PROOF** — satisfied by a driving licence, a passport or a voter ID
+Base, for every personal loan whatever the amount:
+
+- **PAN** - satisfied by a PAN card
+- **ADDRESS_PROOF** - satisfied by a driving licence, a passport or a voter ID
+- **BANK_STATEMENT** - satisfied by a bank statement
 
 Optional:
 
-- **SALARY_SLIP**
 - **PHOTO**
+
+Additional slots the policy can add:
+
+- **INCOME_PROOF** - satisfied by a salary slip, an ITR or a Form 16
+- **EMPLOYMENT_PROOF**
+
+Which of those apply to a given case depends on the loan amount and on the
+applicant's employment type. The case's own response says which rules
+applied, in the `policy.applied_rules` field, and every checklist row names
+the rule that put it there in `rule_ids`.
 
 An optional document never blocks the handoff to CPA. It appears on the
 checklist so a field officer can see what has been collected beyond the

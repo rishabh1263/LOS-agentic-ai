@@ -45,6 +45,7 @@ def persist_los_result(result: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _persist(result: dict[str, Any]) -> dict[str, Any] | None:
+    from app.agents.los import parties
     from app.store import get_repository
     from app.store.models import (
         Applicant,
@@ -103,18 +104,46 @@ def _persist(result: dict[str, Any]) -> dict[str, Any] | None:
 
         document_type = (entry.get("type") or "UNKNOWN").strip().upper()
 
-        # Keyed on case + source_id, so re-uploading the same filename
-        # updates that document rather than accumulating duplicates the
-        # checklist would then count twice.
-        document_id = f"{case_id}:{source_id}"
+        # KEYED ON CASE + PARTY + SOURCE.
+        #
+        # The key used to be `case_id:source_id`. Two people on one case
+        # both uploading `pan.jpg` -- which happens, because phones name
+        # files identically -- collided on one key, and the second upload
+        # silently overwrote the first. The primary applicant's PAN became
+        # the co-applicant's, with no error anywhere.
+        party_id = (entry.get("party_id") or "").strip() or applicant_id
+        party_role = (entry.get("party_role") or "PRIMARY_APPLICANT").strip()
+        document_id = parties.document_key(case_id, party_id, source_id)
 
         existing = repository.get_document(document_id)
+
+        if existing is None and party_role == "PRIMARY_APPLICANT":
+            # ADOPT A ROW WRITTEN BEFORE DOCUMENTS CARRIED A PARTY.
+            #
+            # Without this, the first re-upload after the upgrade writes a
+            # second row for the same file and the checklist shows the
+            # document twice. Only the primary applicant can adopt one: an
+            # unqualified legacy row meant "the case's applicant", and
+            # letting a co-applicant claim it would hand them somebody
+            # else's document.
+            legacy = repository.get_document(
+                parties.legacy_document_key(case_id, source_id)
+            )
+            if legacy is not None and legacy.party_id is None:
+                existing = legacy
+                document_id = legacy.document_id
+
         record = existing or Document(
             document_id=document_id,
             case_id=case_id,
             applicant_id=applicant_id,
             document_type=document_type,
         )
+
+        # Ownership is written on every save, so an adopted legacy row
+        # gains the party it always implicitly had.
+        record.party_id = party_id
+        record.party_role = party_role
 
         record.document_type = document_type
         record.source_id = source_id

@@ -237,7 +237,61 @@ def _confidence(checks: list[Check]) -> int:
     return int(round(100 * conclusive / total))
 
 
+def from_named(
+    checks,
+    *,
+    weights: dict[str, float] | None = None,
+    default_weight: float = 1.0,
+    reason_codes: dict[str, str] | None = None,
+) -> list[Check]:
+    """
+    Adapt a producer's own pass/fail checks into scorable ones.
+
+    WHY THIS IS SHARED. Three producers -- the structural verifier, the
+    specialist capabilities and the deed service -- each report a list of
+    `{name, passed, detail}`, differing only in whether the items are
+    objects or dicts. Writing the same adapter a third time is how the
+    financial path ended up with reason codes while the specialist path
+    did not: each copy grew its own idea of what to include.
+
+    NO HARD GATES ARE PRODUCED. Every producer that uses this has already
+    reached its verdict by its own rules. These checks exist to be
+    weighed into a score and a confidence, not to decide anything, and a
+    gate set here could only ever disagree with the verdict it describes.
+
+    `detail` becomes the human-readable reason where the producer wrote
+    one -- it saw the document, and its sentence is better than anything
+    a catalogue can derive.
+    """
+    weights = weights or {}
+    reason_codes = reason_codes or {}
+    adapted: list[Check] = []
+
+    for item in (checks or []):
+        if isinstance(item, dict):
+            name = str(item.get("name") or "")
+            passed = bool(item.get("passed"))
+            detail = str(item.get("detail") or "").strip()
+        else:
+            name = str(getattr(item, "name", "") or "")
+            passed = bool(getattr(item, "passed", False))
+            detail = str(getattr(item, "detail", "") or "").strip()
+
+        if not name:
+            continue
+
+        adapted.append(Check(
+            name=name,
+            outcome=Outcome.OK if passed else Outcome.BAD,
+            weight=float(weights.get(name, default_weight)),
+            reason_code=None if passed else reason_codes.get(name),
+            reason=None if passed else (detail or None),
+        ))
+
+    return adapted
+
+
 __all__ = [
     "Assessment", "Check", "FAIL", "Outcome", "PASS", "REVIEW", "SKIPPED",
-    "assess",
+    "assess", "from_named",
 ]

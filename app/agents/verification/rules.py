@@ -134,6 +134,75 @@ def _required_fields(document_class: str) -> list[str]:
     return [str(f) for f in (entry.get("required_fields") or [])]
 
 
+def _field_aliases(document_class: str) -> dict[str, list[str]]:
+    """
+    Other names a required field may arrive under.
+
+    WHY THIS EXISTS, and what it cost to not have it.
+
+    A required field is named in configuration; the value is produced by an
+    extractor that names its own keys. Nothing checked that the two agreed,
+    and for VOTER_ID they did not: configuration asked for `voter_id`, the
+    extractor emitted `epic_number`. The number was read correctly, at 0.95
+    confidence, and every voter ID in the service still came back
+    REQUIRED_FIELD_MISSING -> REVIEW. The defect was invisible because each
+    side was individually right.
+
+    THE ALIAS IS NOT THE REAL FIX. It makes the two vocabularies
+    reconcilable, which is worth having -- a lender's configuration should
+    not have to know an extractor's internal key names. What stops the
+    class of bug recurring is the contract test in
+    tests/agents/test_required_field_contract.py, which asserts that every
+    configured required field is producible by that type's extractor spec,
+    through aliases or directly. Adding a required field nobody extracts
+    now fails there instead of silently reviewing every document.
+
+    Read per type, then merged with a global map, so a name shared across
+    types is declared once.
+    """
+    rules = _rules_section()
+    merged: dict[str, list[str]] = {}
+
+    for source in (rules.get("field_aliases") or {},
+                   (rules.get("documents", {}) or {})
+                   .get(document_class.upper(), {}).get("field_aliases") or {}):
+        if not isinstance(source, dict):
+            continue
+        for canonical, alternatives in source.items():
+            if isinstance(alternatives, str):
+                alternatives = [alternatives]
+            merged.setdefault(str(canonical), [])
+            merged[str(canonical)].extend(
+                str(a) for a in (alternatives or [])
+            )
+
+    return merged
+
+
+def _resolve_field(
+    name: str,
+    fields: dict[str, Any],
+    aliases: dict[str, list[str]],
+) -> Any:
+    """
+    The value for a required field, under its own name or any alias.
+
+    The canonical name is tried FIRST. An alias is a fallback for a
+    vocabulary difference, never a way to shadow the real field: a document
+    carrying both must be read as carrying the one configuration asked for.
+    """
+    value = fields.get(name)
+    if str(value or "").strip():
+        return value
+
+    for alternative in aliases.get(name, ()):
+        value = fields.get(alternative)
+        if str(value or "").strip():
+            return value
+
+    return None
+
+
 def _rule_on(document_class: str, name: str, default: bool = True) -> bool:
     section = _rules_section().get("documents", {}) or {}
     entry = section.get(document_class.upper(), {}) or {}
@@ -275,9 +344,10 @@ def _check_required_fields(
     if not required:
         return []
 
+    aliases = _field_aliases(document_class)
     missing = [
         name for name in required
-        if not str(fields.get(name) or "").strip()
+        if _resolve_field(name, fields, aliases) is None
     ]
     if not missing:
         return []
