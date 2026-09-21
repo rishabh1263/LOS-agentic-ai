@@ -63,17 +63,27 @@ documents:
       - slot: ADDRESS_PROOF
         accepts: [DRIVING_LICENCE, PASSPORT, VOTER_ID]
 
+  # PERSONAL_LOAN IS RESOLVED FROM config/policies/personal_loan.yaml.
+  #
+  # That file is the authority: it carries the amount bands, the conditional
+  # rules and the version a case is pinned to, none of which can be
+  # expressed here. This entry is the FALLBACK used only if the policy file
+  # is missing or will not parse, and it is deliberately identical to that
+  # file's BASE requirements -- two files describing the same product will
+  # drift, and when they did, /config advertised one checklist while real
+  # cases were measured against another.
+  #
+  # Do not add an amount-dependent slot here. It cannot be conditional in
+  # this file, so it would be imposed on every application.
   PERSONAL_LOAN:
     required:
       - slot: PAN
         accepts: [PAN]
-      - slot: BANK_STATEMENT
-        accepts: [BANK_STATEMENT]
       - slot: ADDRESS_PROOF
         accepts: [DRIVING_LICENCE, PASSPORT, VOTER_ID]
+      - slot: BANK_STATEMENT
+        accepts: [BANK_STATEMENT]
     optional:
-      - slot: SALARY_SLIP
-        accepts: [SALARY_SLIP]
       - slot: PHOTO
         accepts: [PHOTO]
 

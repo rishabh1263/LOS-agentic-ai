@@ -92,18 +92,22 @@ from app.agents.fraud_risk.config import (
     version as risk_version,
 )
 from app.api.routes.agent_service import router as agent_service_router
+from app.api.routes.applicant_agent_api import router as applicant_agent_router
 from app.api.routes.document_extraction_api import router as document_extraction_router
 from app.api.routes.document_agent_api import router as document_agent_router
 from app.api.routes.financial_api import router as financial_router
+from app.api.routes.fos_api import router as fos_router
 from app.api.routes.los_api import router as los_router
 from app.api.routes.ops import router as ops_router
 from app.api.routes.verification_api import router as verification_router
 from app.llm.config import ollama_host, ollama_model
 from app.security.auth import auth_health, require_jwt, validate_auth_configuration
 
-
-# login routes 
+# Login and JWKS. Deliberately NOT behind require_jwt -- this is how a
+# caller obtains a token in the first place, so protecting it with the
+# thing it issues would be circular.
 from app.api.routes.auth_api import router as auth_router
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -204,6 +208,23 @@ async def lifespan(app: FastAPI):
     else:
         print("LLM warmup         : disabled")
 
+    # The case store, opened before traffic so a broken path is a startup
+    # failure rather than a surprise inside the first FOS question.
+    from app.agents.applicant import config as _applicant_config
+
+    if _applicant_config.enabled():
+        try:
+            from app.store import get_repository, store_backend
+
+            health = get_repository().health()
+            print(f"case store         : {store_backend()}  {health}")
+        except Exception as exc:
+            print(f"CASE STORE FAILED  : {exc}")
+            raise
+        print(f"applicant agent    : enabled  (LLM {_applicant_config.llm_enabled()})")
+    else:
+        print("applicant agent    : disabled")
+
     if not signed:
         print("-" * 58)
         print("WARNING: risk policy is NOT signed off.")
@@ -217,6 +238,8 @@ async def lifespan(app: FastAPI):
     print("  POST /api/v1/financial/verify     Bank statement / ITR / payslip")
     print("  POST /api/v1/financial/extract    Bank statement / ITR / payslip")
     print("  POST /api/v1/los/process          Whole application end to end")
+    print("  POST /api/v1/fos/applicants       FOS: open a case")
+    print("  POST /api/v1/fos/copilot          FOS: copilot (all actions)")
     print("  POST /api/v1/kyc                  Cross-document consistency")
     print("  POST /api/v1/agents/execute       Any agent by id or stage")
     print("  GET  /docs                        Swagger")
@@ -256,6 +279,27 @@ _TAGS = [
     {
         "name": "Orchestration",
         "description": "Execute any agent by id or stage through LangGraph.",
+    },
+    {
+        "name": "FOS",
+        "description": (
+            "The field-officer integration surface. TWO endpoints: "
+            "POST /api/v1/fos/applicants opens a case, and "
+            "POST /api/v1/fos/copilot serves every question, dropdown action "
+            "and document upload. One response shape for all of them. "
+            "Credit, risk, KYC and lending questions are routed downstream, "
+            "never answered here."
+        ),
+    },
+    {
+        "name": "Applicant Agent",
+        "description": (
+            "The FOS copilot. Natural-language questions about an applicant, "
+            "their application, documents, what is pending and whether the "
+            "case is ready for CPA -- answered from stored records. Credit, "
+            "risk, KYC and lending decisions are routed downstream, never "
+            "answered here."
+        ),
     },
     {"name": "Ops", "description": "Liveness, readiness and metrics."},
 ]
@@ -305,6 +349,24 @@ app.include_router(
 
 app.include_router(
     los_router,
+    prefix="/api/v1",
+    dependencies=[Depends(require_jwt)],
+)
+
+# The FOS copilot. Reaches applicant, application and document records only
+# through app/mcp/applicant.py, and enforces scope and case ownership before
+# any of them is read.
+app.include_router(
+    applicant_agent_router,
+    prefix="/api/v1",
+    dependencies=[Depends(require_jwt)],
+)
+
+# The consolidated FOS surface: two endpoints a field-officer frontend
+# integrates against. Thin adapters over the Applicant Agent above, which
+# keeps its own routes for existing callers.
+app.include_router(
+    fos_router,
     prefix="/api/v1",
     dependencies=[Depends(require_jwt)],
 )
@@ -378,7 +440,8 @@ def custom_openapi() -> dict[str, Any]:
     app.openapi_schema = schema
     return schema
 
-# Login + JWKS: unauthenticated by design — this is how a token is obtained
+
+# Login + JWKS: unauthenticated by design -- this is how a token is obtained.
 app.include_router(auth_router)
 
 

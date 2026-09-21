@@ -169,15 +169,35 @@ def test_a_bank_statement_gets_basic_verification_only(client, kyc_tripwire):
     assert not kyc_tripwire
 
     # No financial analysis anywhere in the response.
+    #
+    # THE MARKERS ARE ANALYSIS OUTPUTS, NOT THE WORD "INCOME". A bare
+    # substring search for "income" also matched INCOME_PROOF -- a
+    # CHECKLIST SLOT naming a document to collect, which is a FOS-stage
+    # requirement and the opposite of a leak. Broadening a guard until it
+    # catches the thing it is protecting makes it useless: the next person
+    # to hit it deletes it.
+    #
+    # What must never appear is a FIGURE DERIVED FROM the statement -- an
+    # estimated income, a total, a score. `income_estimate` and
+    # `monthly_income` are those; `income_proof` is not.
     import json
 
     blob = json.dumps(body).lower()
     for forbidden in ("average_monthly_credit", "monthly_net_salary",
                       "total_credit", "total_debit", "transactions",
-                      "income", "risk_score", "creditworth"):
+                      "income_estimate", "estimated_income", "monthly_income",
+                      "income_analysis", "risk_score", "creditworth",
+                      "affordability", "cash_flow", "spending"):
         assert forbidden not in blob, (
             f"{forbidden!r} leaked financial analysis into a FOS response"
         )
+
+    # And the word "income" may appear ONLY as a document slot name.
+    for occurrence in blob.split('"'):
+        if "income" in occurrence:
+            assert occurrence.strip().lower() in {"income_proof"}, (
+                f"{occurrence!r} mentions income and is not a document slot"
+            )
 
 
 def test_a_reviewed_document_is_never_reported_as_rejected(client):

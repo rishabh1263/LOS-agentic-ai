@@ -23,13 +23,105 @@ from app.agents.applicant.intents import Intent
 logger = logging.getLogger(__name__)
 
 
+#: Slot and type names that are acronyms. `.title()` turns PAN into "Pan"
+#: and ITR into "Itr", which reads as a typo in an answer a customer is
+#: shown.
+_ACRONYMS = frozenset({"PAN", "ITR", "DL", "KYC", "NOC", "GST", "CPA",
+                       "FORM_16"})
+
+
 def _readable(value: str | None) -> str:
-    return str(value or "").replace("_", " ").title()
+    raw = str(value or "")
+    if raw.upper() in _ACRONYMS:
+        return raw.upper().replace("_", " ")
+    return " ".join(
+        word.upper() if word.upper() in _ACRONYMS else word.title()
+        for word in raw.replace("_", " ").split()
+    )
 
 
 def _doc_line(document: dict[str, Any]) -> str:
     status = document.get("status", "UNKNOWN")
     return f"{_readable(document.get('document_type'))} — {status}"
+
+
+def _provisional(policy: dict[str, Any] | None) -> list[str]:
+    """
+    The sentence a checklist needs when a rule could not be evaluated.
+
+    Empty when every rule was decided, because a case that has captured
+    everything should not be told about a caveat that does not apply to it.
+    """
+    gaps = (policy or {}).get("unevaluated_rules") or []
+    if not gaps:
+        return []
+
+    attributes: list[str] = []
+    for gap in gaps:
+        for attribute in gap.get("missing_attributes") or []:
+            readable = str(attribute).replace("_", " ")
+            if readable not in attributes:
+                attributes.append(readable)
+    if not attributes:
+        return []
+
+    return [
+        "This list is not final: "
+        + ", ".join(attributes)
+        + (" has" if len(attributes) == 1 else " have")
+        + " not been captured, so the rules that depend on "
+        + ("it" if len(attributes) == 1 else "them")
+        + " could not be applied."
+    ]
+
+
+def _explain_policy(policy: dict[str, Any] | None,
+                    checklist: list[dict[str, Any]] | None) -> str:
+    """
+    Why this case's checklist is what it is.
+
+    STRAIGHT FROM THE RESOLUTION. Every sentence restates something the
+    policy engine computed -- which rules fired, which could not, and what
+    each one asked for. Nothing here reasons about lending, and nothing
+    here is phrased by a model.
+    """
+    policy = policy or {}
+    parts: list[str] = []
+
+    applied = policy.get("applied_rules") or []
+    if applied:
+        parts.append(
+            f"This checklist comes from policy {policy.get('policy_id')} "
+            f"version {policy.get('policy_version')}. "
+            f"{len(applied)} rule(s) applied: {', '.join(applied)}."
+        )
+    else:
+        parts.append("No document policy rule applied to this case.")
+
+    if policy.get("status") == "UNCONFIRMED":
+        parts.append(
+            "The thresholds in that policy are placeholders that have not "
+            "been confirmed by a lender."
+        )
+
+    for gap in (policy.get("unevaluated_rules") or []):
+        reason = str(gap.get("reason") or "").strip()
+        wanted = gap.get("would_require") or []
+        sentence = reason or f"{gap.get('rule_id')} could not be evaluated."
+        if wanted:
+            sentence += (" It would have required: "
+                         + ", ".join(_readable(w) for w in wanted) + ".")
+        parts.append(sentence)
+
+    conditional = [e for e in (checklist or [])
+                   if e.get("applicable_conditions")]
+    for entry in conditional:
+        parts.append(
+            f"{_readable(entry['slot'])} applies because "
+            + ", ".join(entry["applicable_conditions"]) + "."
+        )
+
+    return " ".join(parts)
 
 
 # ==========================================================================
@@ -88,6 +180,10 @@ def deterministic_answer(
         return (f"The case is currently at "
                 f"{_readable(view.get('stage'))}.")
 
+    if intent is Intent.POLICY_EXPLANATION:
+        payload = _result(results, "documents.checklist") or {}
+        return _explain_policy(payload.get("policy"), payload.get("checklist"))
+
     if intent is Intent.DOCUMENTS_UPLOADED:
         documents = _get(results, "documents.get", "documents") or []
         if not documents:
@@ -127,6 +223,14 @@ def deterministic_answer(
                             for e in optional)
                 + "."
             )
+
+        # A CHECKLIST THAT IS NOT FINAL MUST NOT READ AS IF IT WERE.
+        #
+        # When a rule could not be evaluated -- no loan amount captured, no
+        # employment type -- its documents are deliberately not imposed.
+        # Listing the rest without saying so hands an officer a short list
+        # that looks complete, and they collect to it and arrive short.
+        parts.extend(_provisional(payload.get("policy")))
         return " ".join(parts)
 
     if intent is Intent.DOCUMENTS_PENDING:

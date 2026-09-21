@@ -698,17 +698,36 @@ _OCR_THREAD_PREFIX = "ocr"
 # cores for, and capped well below it, because each engine also runs its own
 # ONNX threads and over-subscribing makes every document slower rather than
 # faster. DOCUMENT_OCR_WORKERS still overrides it, including back down to 1.
-# Measured on a 16-core host, warm 4-document request:
 #
-#     workers   1        2        3        4
-#     wall   8444 ms  6912 ms  7165 ms  7722 ms
+# TWO MEASUREMENTS EXIST AND THEY DISAGREE. Both are kept, because the
+# disagreement is the useful part: this number is host-dependent and the
+# next person to tune it needs to know that, not just the answer.
 #
-# Two is the optimum and it is not close to linear: each engine runs its own
-# ONNX threads, so past two they compete for the same cores and every
-# document gets slower. Cold start also costs one model load per worker,
-# which is why startup warms them all rather than paying it inside a request.
+#     16-core host, warm 4-document request, earlier run:
+#         workers   1        2        3        4
+#         wall   8444 ms  6912 ms  7165 ms  7722 ms
+#
+#     16-logical host, warm 4-document request, best of two, later run:
+#         workers            2        3        4
+#         wall            7780 ms  6297 ms  6002 ms
+#         summed OCR     10087 ms 11137 ms 16768 ms
+#
+# The second run puts the knee at three rather than two. The runs are not
+# reconcilable from here -- different load, and the later one saw large
+# run-to-run variance (11819 ms cold against 7780 ms warm on the same
+# configuration) -- so the default follows the more recent measurement and
+# the override exists for hosts where it does not hold.
+#
+# WHAT DOES NOT CHANGE with the count: `_default_ocr_threads` divides the
+# machine between the workers, so three workers each get fewer ONNX threads
+# rather than three engines all claiming the whole box. That derivation is
+# why the summed OCR time rises while the wall time falls -- more overlap,
+# each pass individually slower. Wall time is what a caller waits for.
+#
+# Cold start still costs one model load per worker, which is why startup
+# warms them all rather than paying it inside a request.
 def _default_ocr_workers() -> int:
-    return max(1, min(2, os.cpu_count() or 1))
+    return max(1, min(3, os.cpu_count() or 1))
 
 
 def _default_ocr_threads() -> int:

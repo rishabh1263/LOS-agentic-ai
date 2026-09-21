@@ -649,7 +649,27 @@ DOCUMENT_TYPE_MISMATCH = "DOCUMENT_TYPE_MISMATCH"
 
 def _serialise_identity_verification(
     result: QuickVerification,
+    *,
+    tokens: list[Any] | None = None,
+    quality_report: Any = None,
+    extracted_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """
+    The public verification block for an identity document.
+
+    NOW CARRIES SCORE AND CONFIDENCE. It did not, and the fields were
+    simply absent from every PAN, licence, passport and voter ID -- the
+    reusable scoring framework existed and was wired to the bank-statement
+    path only, so a reviewer triaging identity documents had a verdict and
+    nothing to rank by.
+
+    `status` IS UNCHANGED AND STILL COMES FROM THE GATES. The scoring
+    module returns a verdict of its own and it is deliberately discarded:
+    the structural gates in basic.py and the post-extraction rules in
+    rules.py decide, exactly as before, and a second opinion computed here
+    could only ever disagree with them. The numbers describe the verdict;
+    they do not participate in reaching it.
+    """
     checks = {
         check.name: (
             "PASS"
@@ -659,7 +679,7 @@ def _serialise_identity_verification(
         for check in result.checks
     }
 
-    return {
+    payload: dict[str, Any] = {
         "status": result.status,
         "checks": checks,
         # Previously dropped here. The verifier recorded exactly why it
@@ -680,6 +700,93 @@ def _serialise_identity_verification(
             else []
         ),
     }
+
+    payload.update(_identity_score(
+        document_class=str(getattr(result.document_class, "value",
+                                   result.document_class)),
+        verification=result,
+        tokens=tokens,
+        quality_report=quality_report,
+        extracted_fields=extracted_fields,
+        passing=result.status == "PASS",
+    ))
+
+    return payload
+
+
+def _identity_score(
+    *,
+    document_class: str,
+    verification: QuickVerification,
+    tokens: list[Any] | None,
+    quality_report: Any,
+    extracted_fields: dict[str, Any] | None,
+    passing: bool,
+) -> dict[str, Any]:
+    """
+    The two numbers, and the image-quality notes that explain a non-pass.
+
+    Never raises: a document must not fail to return because a score could
+    not be computed. A missing score is reported as absent, which is what
+    it was before this existed.
+    """
+    try:
+        from app.agents.verification import identity_checks, rules, scoring
+
+        required = rules._required_fields(document_class)
+        aliases = rules._field_aliases(document_class)
+        fields = extracted_fields or {}
+
+        # Resolved through the SAME alias map the required-field rule
+        # uses. Scoring a field as missing that the rule counts as present
+        # would put the score and the verdict at odds on the very document
+        # the alias exists for.
+        resolved = {
+            name: rules._resolve_field(name, fields, aliases)
+            for name in required
+        }
+
+        assessment = scoring.assess(
+            document_class,
+            identity_checks.checks_for(
+                verification,
+                required_fields=required,
+                extracted_fields=resolved,
+            ),
+        )
+        published = assessment.public()
+
+        confidence = identity_checks.confidence_for(
+            published["verification_confidence"],
+            tokens=tokens,
+            quality_report=quality_report,
+            required_fields=required,
+            extracted_fields=resolved,
+        )
+
+        block: dict[str, Any] = {
+            "verification_score": published["verification_score"],
+            "verification_confidence": confidence,
+        }
+
+        # IMAGE-QUALITY NOTES ONLY ON A NON-PASS. A passing document
+        # carrying DOCUMENT_IMAGE_BLURRY reads as a problem with it, when
+        # the blur was recovered and every field validated. These make a
+        # REVIEW actionable; they do not annotate success.
+        if not passing:
+            evidence_codes = identity_checks.evidence_reason_codes(
+                quality_report)
+            evidence_reasons = identity_checks.evidence_reasons(quality_report)
+            if evidence_codes:
+                block["evidence_reason_codes"] = evidence_codes
+            if evidence_reasons:
+                block["reasons"] = evidence_reasons
+
+        return block
+
+    except Exception:  # pragma: no cover - scoring must never break a read
+        logger.exception("Identity verification scoring failed")
+        return {}
 
 
 def _serialise_financial_extraction(
@@ -770,11 +877,20 @@ def _serialise_financial_verification(
     changed is that an INCONCLUSIVE result now says so, in a sentence a field
     officer can read, with a code a queue can route on.
     """
-    from app.agents.verification import scoring
+    from app.agents.verification import financial_checks, scoring
 
-    # Fall back to the original mapping when a verifier supplied no evidence
-    # -- ITR and salary slips do not yet, and must keep working exactly as
-    # they did.
+    document_type = str(
+        getattr(result.document_type, "value", result.document_type) or ""
+    ).upper()
+
+    # A verifier that supplied no named evidence of its own -- ITR and
+    # salary slips do not -- is scored from the NORMALISED result instead.
+    #
+    # THE VERDICT IS UNCHANGED. It is still derived from `verified`,
+    # exactly as before, and the scoring module's own status is discarded:
+    # these documents produced this verdict before scoring existed and
+    # they must produce it after. What is new is that they now carry the
+    # two numbers and a reason code, which they did not.
     if not result.verification_checks:
         status = "REVIEW"
         if result.verified is True:
@@ -787,16 +903,37 @@ def _serialise_financial_verification(
             checks["note"] = result.verification_note
 
         payload: dict[str, Any] = {"status": status, "checks": checks}
+
+        derived = scoring.assess(
+            document_type or "FINANCIAL_DOCUMENT",
+            financial_checks.checks_for(result),
+        )
+        published = derived.public()
+        payload["verification_score"] = published["verification_score"]
+        payload["verification_confidence"] = financial_checks.confidence_for(
+            published["verification_confidence"], result,
+        )
+
         if status != "PASS":
-            payload["reason_codes"] = ["VERIFICATION_INCONCLUSIVE"]
-            payload["reasons"] = [
+            # The derived codes are more specific than the blanket
+            # VERIFICATION_INCONCLUSIVE this used to emit for everything:
+            # they distinguish a scan awaiting OCR from an unreadable file
+            # from an integrity check that ran and failed.
+            payload["reason_codes"] = (
+                published["reason_codes"] or ["VERIFICATION_INCONCLUSIVE"]
+            )
+            payload["reasons"] = published["reasons"] or [
                 "This document needs review because its verification could "
                 "not be completed."
             ]
         return payload
 
     assessment = scoring.assess(
-        "BANK_STATEMENT",
+        # The document's OWN type, not BANK_STATEMENT. Hardcoding the one
+        # type that had evidence meant per-type weights configured for any
+        # other could never take effect -- a configuration surface that
+        # silently did nothing.
+        document_type or "BANK_STATEMENT",
         [
             scoring.Check(
                 name=c.get("name", ""),
@@ -1094,6 +1231,12 @@ def _identity_response(
     supported_when_unverified: bool,
     extra_errors: list[dict[str, Any]],
     timings: "Timings | None" = None,
+    # EVIDENCE FOR THE CONFIDENCE FIGURE, not for the verdict. Optional so
+    # every existing caller keeps working unchanged; a caller that does
+    # not supply them gets a confidence computed from conclusiveness
+    # alone, which is what the scoring module did before.
+    tokens: list[Any] | None = None,
+    quality_report: Any = None,
 ) -> dict[str, Any]:
     """
     Build the identity response, applying the VERIFY/EXTRACT gate.
@@ -1262,8 +1405,17 @@ def _identity_response(
     # fields are released only behind a pass, and a verdict that is no longer
     # a pass must not keep the fields it was granted while it was one.
     # ------------------------------------------------------------------
-    verification_payload = _serialise_identity_verification(verification)
     serialised_extraction = _serialise_extraction(extraction)
+
+    # Serialised FIRST, so the score can be told which fields actually
+    # arrived. Scoring a document before knowing what was extracted from
+    # it would report field coverage of zero on a complete document.
+    verification_payload = _serialise_identity_verification(
+        verification,
+        tokens=tokens,
+        quality_report=quality_report,
+        extracted_fields=(serialised_extraction or {}).get("fields") or {},
+    )
 
     from app.agents.verification import rules as _rules
 
@@ -1591,6 +1743,8 @@ def _process_image(
         supported_when_unverified=True,
         extra_errors=[],
         timings=timings,
+        tokens=tokens,
+        quality_report=recognition.quality,
     )
 
 
@@ -1598,32 +1752,39 @@ def _process_image(
 # PDF workflow
 # ---------------------------------------------------------------------------
 
-def _render_pdf_page(
-    path: str,
-    number: int,
-):
-    """Rasterise exactly one PDF page using Poppler."""
+def _render_pdf_page(path: str, number: int):
+    """
+    Rasterise exactly one page.
+
+    POPPLER IS FOUND ON PATH, OR NAMED BY THE ENVIRONMENT. Nothing is
+    hardcoded: a build that ships Poppler somewhere the process PATH
+    does not cover sets `POPPLER_PATH`, and a build where `pdftoppm` is
+    already on PATH sets nothing and is unaffected.
+
+    This exists because the alternative was tried. A developer machine
+    needed a path, and the fix committed was the literal path of that
+    machine's Poppler install -- which renders every PDF on that laptop
+    and none anywhere else, including CI.
+    """
+    import os
 
     from pdf2image import convert_from_path
 
-    poppler_dir = r"D:\Application Download\poppler-26.09.0\Library\bin"
-
-    logger.info(
-        "Rendering PDF page=%s path=%s poppler=%s",
-        number,
-        path,
-        poppler_dir,
-    )
+    options: dict[str, Any] = {}
+    poppler_path = (os.getenv("POPPLER_PATH") or "").strip()
+    if poppler_path:
+        options["poppler_path"] = poppler_path
 
     pages = convert_from_path(
         path,
         dpi=pdf_render_dpi(),
         first_page=number,
         last_page=number,
-        poppler_path=poppler_dir,
+        **options,
     )
 
     return pages[0] if pages else None
+
 
 def _merge_pages(
     results: list[DocumentExtractionResult],
@@ -1960,6 +2121,8 @@ def _process_pdf(
             ),
             extra_errors=errors,
             timings=timings,
+            tokens=primary.tokens,
+            quality_report=primary.quality,
         )
 
     except Exception as exc:

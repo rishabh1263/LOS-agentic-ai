@@ -27,9 +27,14 @@ from app.store.sqlite_repo import SQLiteRepository
 ENVELOPE = {
     "request_id", "applicant_id", "case_id", "action", "intent", "answer",
     "applicant", "application", "stage", "documents", "checklist",
-    "required_documents", "pending_items", "verification", "kyc", "knowledge",
-    "category", "next_action", "readiness", "actions", "route_to",
-    "response_source", "processing_ms", "errors",
+    "required_documents", "policy", "pending_items", "verification", "kyc",
+    "knowledge", "category", "next_action", "readiness", "actions",
+    "route_to", "response_source", "processing_ms", "errors",
+    # the frontend contract
+    "query_type", "case_state", "suggested_questions", "available_actions",
+    "document_highlights", "clarification_required",
+    # conversation plumbing -- the caller carries it, this service does not
+    "followed_up", "context",
 }
 
 FOS_SCOPES = [
@@ -131,13 +136,30 @@ def test_opening_a_case_returns_the_unified_envelope(client):
 
 
 def test_the_checklist_is_initialised_from_the_product(client):
+    """
+    The checklist comes from the product's CONFIGURED policy.
+
+    This used to assert a literal list copied out of applicant_agent.yaml,
+    which made the test a second copy of the configuration: editing the
+    policy broke the test whether or not the service had done anything
+    wrong. What matters is that the API returns what the policy engine
+    resolves rather than a list of its own, so that is what is asserted --
+    plus the one thing that is true of a personal loan under any policy
+    worth the name, that identity and address evidence are required.
+    """
+    from app.agents.policy import engine as policy
+
     response = client.post("/api/v1/fos/applicants", json={
         "applicant": {"full_name": "Checklist Test"},
         "application": {"product": "PERSONAL_LOAN"},
     })
     body = response.json()
 
-    assert body["required_documents"] == ["PAN", "BANK_STATEMENT", "ADDRESS_PROOF"]
+    resolved = policy.resolve("PERSONAL_LOAN")
+    assert body["required_documents"] == [
+        r.slot for r in resolved.requirements if r.mandatory]
+    assert "PAN" in body["required_documents"]
+    assert "ADDRESS_PROOF" in body["required_documents"]
     assert all(e["status"] == "MISSING" for e in body["checklist"])
     assert body["readiness"]["status"] == "NOT_READY"
 
@@ -149,9 +171,10 @@ def test_optional_slots_appear_but_are_not_required(client):
     }).json()
 
     optional = [e for e in body["checklist"] if not e["mandatory"]]
-    assert {e["slot"] for e in optional} == {"SALARY_SLIP", "PHOTO"}
-    assert not any(slot in body["required_documents"]
-                   for slot in ("SALARY_SLIP", "PHOTO"))
+
+    assert optional, "no optional slot is configured, so nothing is tested"
+    assert all(e["requirement"] == "OPTIONAL" for e in optional)
+    assert not any(e["slot"] in body["required_documents"] for e in optional)
 
 
 def test_a_case_without_a_product_still_has_a_checklist(client):

@@ -107,6 +107,22 @@ class ProcessedDocument(BaseModel):
     """One uploaded document, as the client sees it."""
 
     source_id: str = Field(..., description="The filename as uploaded.")
+    party_id: str | None = Field(
+        None,
+        description=(
+            "Which person on the case this document belongs to. Present "
+            "whenever parties were supplied. Two people on one case may "
+            "upload files with the same name — this is what tells them "
+            "apart, and a frontend should group documents by it rather "
+            "than by filename or upload order."
+        ),
+        examples=["APP-3D51FFAC6342"],
+    )
+    party_role: str | None = Field(
+        None,
+        description="`PRIMARY_APPLICANT` or `CO_APPLICANT`.",
+        examples=["PRIMARY_APPLICANT"],
+    )
     type: str = Field(
         ...,
         description="The type this service identified. UNKNOWN when it could not.",
@@ -131,7 +147,13 @@ class ProcessedDocument(BaseModel):
         description=(
             "The extracted fields, released ONLY behind a verification PASS "
             "and only while extraction is enabled. Absent otherwise. The keys "
-            "depend on the document type."
+            "depend on the document type.\n\n"
+            "Values are JSON-native: money is a **number**, never a "
+            "stringified `Decimal`. An `address` is an **object** of "
+            "components rather than the printed line, and is omitted "
+            "when no component could be identified -- a field whose "
+            "value would be the recogniser's read of a region is not a "
+            "field worth publishing."
         ),
         examples=[{
             "pan_number": "ABCPV1234K",
@@ -222,21 +244,31 @@ class KycFieldSource(BaseModel):
 
     source_id: str = Field(..., description="The filename as uploaded.")
     document_type: str = Field(..., examples=["PAN", "DRIVING_LICENCE"])
-    value: Any = Field(
+    value: str | dict[str, str] | float | int | None = Field(
         None,
         description=(
             "What this document carried, as extraction released it. Already "
             "published under documents[].extraction -- never OCR text, "
-            "tokens or boxes."
+            "tokens or boxes.\n\n"
+            "An ADDRESS arrives as components (`pincode`, `state`, "
+            "`city`, and the free-text parts where they are short "
+            "enough to be real ones), because the printed line on a "
+            "card is read as one region and its unplaced remainder is "
+            "recogniser output, not a value. Omitted entirely when "
+            "nothing usable could be identified."
         ),
     )
-    normalized_value: Any = Field(
+    normalized_value: str | dict[str, str] | float | int | None = Field(
         None,
         description=(
             "What was actually compared. Published beside `value` so a "
             "near-miss can be read correctly: the difference is either in "
             "the documents or in the normalisation, and only showing both "
-            "says which."
+            "says which.\n\n"
+            "**Absent when normalisation changed nothing** — on most rows "
+            "it did, and repeating the value said the same thing twice. "
+            "Also absent on an ADDRESS, where the canonical components "
+            "in `value` are themselves the normalised form."
         ),
     )
 
@@ -254,6 +286,17 @@ class KycFieldResult(BaseModel):
         ...,
         examples=["NAME", "DATE_OF_BIRTH", "PAN_NUMBER", "FATHER_NAME",
                   "ADDRESS"],
+    )
+    party_id: str | None = Field(
+        None,
+        description=(
+            "Whose row this is. Present **only** on the case-level `kyc` "
+            "of a two-party case, where both parties contribute a NAME "
+            "row and a reviewer must be able to tell them apart. Absent "
+            "on a single-applicant response and inside a party's own "
+            "`kyc`, where it would say nothing."
+        ),
+        examples=["APP-1", "COAPP-7F2A11C4D9E0"],
     )
     status: str = Field(
         ...,
@@ -291,9 +334,18 @@ class KycFieldResult(BaseModel):
     reason_code: str = Field(
         "", examples=["EXACT_MATCH", "PARTIAL_ADDRESS_MATCH", "NAME_MISMATCH"]
     )
-    reason: str = Field(
-        "",
-        description="Deterministic. Never model-generated.",
+    reason: str | None = Field(
+        None,
+        description=(
+            "Deterministic. Never model-generated.\n\n"
+            "**Absent whenever `reason_code` is present**, which is "
+            "almost always: `NAME_MISMATCH` beside \"Name differs "
+            "across PAN and Driving Licence.\" is the same fact twice, "
+            "and the sentence was the largest thing in a party's KYC "
+            "after the sources. Present only on the rare row that "
+            "reached a verdict without a code, where the sentence is "
+            "the only explanation there is."
+        ),
         examples=["Name matches across PAN and Driving Licence."],
     )
     sources: list[KycFieldSource] = Field(default_factory=list)
@@ -324,9 +376,16 @@ class KycSummary(BaseModel):
         0, ge=0, le=100,
         description="Weighted mean of the field confidences, same basis.",
     )
-    fields: list[KycFieldResult] = Field(
-        default_factory=list,
-        description="One row per comparable identity field.",
+    fields: list[KycFieldResult] | None = Field(
+        None,
+        description=(
+            "One row per comparable identity field.\n\n"
+            "**Absent from the case-level `kyc` on a two-party case**, "
+            "where every row is already published under the party it "
+            "belongs to and a second copy could not say whose was "
+            "whose. Present on a single-applicant case, and always "
+            "present inside a party's own `kyc`."
+        ),
     )
 
 
@@ -384,11 +443,199 @@ class CrossDocument(BaseModel):
     checks: list[CrossDocumentCheck] = Field(default_factory=list)
 
 
+class ProfileMatchSource(BaseModel):
+    """The document a profile field was checked against."""
+
+    source_id: str = Field(..., examples=["pan.jpg"])
+    document_type: str | None = Field(None, examples=["PAN"])
+
+
+class ProfileFieldMatch(BaseModel):
+    """One declared field, compared against this party's own documents."""
+
+    field: str = Field(..., examples=["PAN_NUMBER"])
+    status: str = Field(
+        ...,
+        description=(
+            "PASS, PARTIAL, FAIL or SKIPPED. **SKIPPED is not a mismatch.** "
+            "It means the comparison could not be made -- the value was "
+            "never supplied, or no verified document released it."
+        ),
+        examples=["PASS", "PARTIAL", "FAIL", "SKIPPED"],
+    )
+    match_score: int = Field(
+        ...,
+        description=(
+            "0-100, how closely the two values agree. 0 on a SKIPPED field "
+            "means nothing was compared, not that nothing matched."
+        ),
+        examples=[100],
+    )
+    confidence: int = Field(
+        ...,
+        description=(
+            "0-100, how far that answer can be relied on. NOT a rescale of "
+            "match_score: a perfect match read off a poor photograph is a "
+            "high score at a lower confidence."
+        ),
+        examples=[94],
+    )
+    reason_code: str | None = Field(None, examples=["PROFILE_MATCH"])
+    reason: str | None = Field(
+        None,
+        examples=["The PAN on PAN matches the one supplied for this party."],
+    )
+    source: ProfileMatchSource | None = None
+
+
+class PartyProfileMatch(BaseModel):
+    """
+    One party's declared profile against that party's own documents.
+
+    SEPARATE FROM KYC, AND SEPARATE PER PARTY. KYC asks whether the
+    documents agree with each other; this asks whether they describe the
+    person the application declared. The primary applicant's profile is
+    only ever compared with the primary applicant's documents.
+
+    IT DECIDES NOTHING. Every verdict, reason code and score elsewhere in
+    this response is what verification found, with or without this block.
+    """
+
+    party_id: str = Field(..., examples=["APP-1"])
+    party_role: str = Field(..., examples=["PRIMARY_APPLICANT", "CO_APPLICANT"])
+    score: int = Field(
+        ...,
+        description=(
+            "0-100 over the fields ACTUALLY COMPARED. A field nobody could "
+            "compare contributes nothing, so a gap never reads as a "
+            "disagreement -- read it beside fields_compared."
+        ),
+        examples=[100],
+    )
+    confidence: int = Field(..., examples=[94])
+    fields_expected: int = Field(
+        ..., description="Declared for this party.", examples=[3]
+    )
+    fields_extracted: int = Field(
+        ..., description="Released by this party's documents.", examples=[2]
+    )
+    fields_compared: int = Field(
+        ...,
+        description="Present on both sides, so actually checked.",
+        examples=[2],
+    )
+    fields: list[ProfileFieldMatch] = Field(default_factory=list)
+
+
+class PartyVerificationSummary(BaseModel):
+    """
+    How one party's documents came out, counted.
+
+    DERIVED, NEVER DECIDED. Every number is a tally of verdicts
+    verification already reached; nothing here can change an outcome. The
+    four buckets always sum to `total_documents`.
+    """
+
+    total_documents: int = Field(..., examples=[3])
+    passed: int = Field(..., examples=[2])
+    review: int = Field(..., examples=[1])
+    failed: int = Field(
+        ...,
+        description=(
+            "FAILED and REJECTED together: one means the file could not "
+            "be processed and the other that it was processed and "
+            "refused, and triage treats both the same. The distinction "
+            "survives on each document's own `verification`."
+        ),
+        examples=[0],
+    )
+    skipped: int = Field(..., examples=[0])
+
+
+class PartySection(BaseModel):
+    """
+    One party's slice of the response: whose, what they sent, how it went.
+
+    A REGROUPING, NOT A SECOND RESULT. `document_ids` names this
+    party's entries in the top-level `documents[]`, split by the
+    `party_id` stamped on each one -- never by filename or document
+    type, because both parties routinely upload `pan.jpg` and both
+    routinely send a PAN.
+
+    `primary_applicant` is always present. `co_applicant` appears only
+    when the case actually has a second party.
+    """
+
+    party_id: str = Field(..., examples=["APP-1"])
+    role: str = Field(..., examples=["PRIMARY_APPLICANT", "CO_APPLICANT"])
+    status: str | None = Field(
+        None,
+        description=(
+            "**This party's document and KYC state only** -- the same "
+            "worst-wins roll-up the case uses, over this party's own "
+            "documents and their own KYC.\n\n"
+            "It is NOT a decision and there is deliberately no "
+            "party-level `next_action`: a party-level CONTINUE beside a "
+            "case-level MANUAL_REVIEW would read as permission to "
+            "proceed. There is ONE decision on a loan, and `decision` "
+            "and `next_action` stay at the top level where they are "
+            "true.\n\n"
+            "A party who has been declared but has uploaded nothing "
+            "reports REVIEW, never SUCCESS -- nothing is known about "
+            "them yet."
+        ),
+        examples=["SUCCESS", "PARTIAL", "REVIEW", "REJECTED", "FAILED"],
+    )
+    document_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "This party's documents, by `source_id` -- the filename as "
+            "uploaded.\n\n"
+            "**References, not copies.** The full objects are published "
+            "once in the top-level `documents[]`, each already carrying "
+            "its own `party_id`; repeating them here put every document "
+            "in the response twice. Join on `source_id` within a party, "
+            "or filter `documents[]` by `party_id` directly."
+        ),
+        examples=[["pan.jpg", "dl.jpg"]],
+    )
+    verification_summary: PartyVerificationSummary
+    profile_match: PartyProfileMatch | None = Field(
+        None,
+        description=(
+            "**Absent** when this party had no declared or stored profile "
+            "to match -- an empty object would read as 'we matched and "
+            "found nothing', which is a much stronger claim."
+        ),
+    )
+    kyc: KycSummary | None = Field(
+        None,
+        description=(
+            "**This party's own** cross-document KYC: do THEIR documents "
+            "describe one person? Never compared against the other "
+            "party's documents -- two people disagreeing is what a joint "
+            "application IS, not evidence against it. Absent when this "
+            "party released nothing to cross-check."
+        ),
+    )
+
+
 class LosProcessResponse(BaseModel):
     """One applicant's documents, processed end to end."""
 
     request_id: str = Field(..., examples=["los_8604ee9d1f2b4c0a9e7d3f1a2b3c4d5e"])
     applicant_id: str | None = None
+    co_applicant_id: str | None = Field(
+        None,
+        description=(
+            "The second party on this case. **Absent entirely** on a "
+            "single-applicant case — a null here would read as 'there is "
+            "a co-applicant and we do not know who'. Both parties share "
+            "the one `case_id`; each document says which of them it "
+            "belongs to in `documents[].party_id`."
+        ),
+        examples=["COAPP-7F2A11C4D9E0"],
+    )
     case_id: str = Field(
         ...,
         description="Generated when none is supplied. One applicant may hold several.",
@@ -412,7 +659,20 @@ class LosProcessResponse(BaseModel):
         examples=["PASS", "REVIEW", "REJECT"],
     )
     next_action: str = Field(
-        ..., examples=["CONTINUE", "MANUAL_REVIEW", "REQUEST_VALID_DOCUMENT"]
+        ...,
+        description=(
+            "What should happen to this application next, derived from "
+            "results that are already final. `REQUEST_CORRECT_DOCUMENT` "
+            "means the wrong file was sent and "
+            "`REQUEST_VALID_DOCUMENT` that the right one could not be "
+            "read -- the applicant has to do different things about "
+            "those two.\n\n"
+            "Case-level and authoritative: there is no party-level "
+            "`next_action`, because one beside a case-level "
+            "`MANUAL_REVIEW` would read as permission to proceed."
+        ),
+        examples=["CONTINUE", "MANUAL_REVIEW", "REQUEST_VALID_DOCUMENT",
+                  "REQUEST_CORRECT_DOCUMENT"],
     )
     summary: str = Field(..., description="One sentence. Never decides anything.")
     summary_source: str = Field(
@@ -427,6 +687,30 @@ class LosProcessResponse(BaseModel):
     processing_ms: float = Field(
         ..., description="How long the call took. Stage timings stay internal."
     )
+    profile_match: list[PartyProfileMatch] | None = Field(
+        None,
+        description=(
+            "One entry per party whose profile was supplied or held on "
+            "file. **Absent entirely** when no profile was available to "
+            "match -- this block is additional evidence and never changes "
+            "a verdict above."
+        ),
+    )
+    primary_applicant: PartySection | None = Field(
+        None,
+        description=(
+            "The primary applicant's documents, profile match and "
+            "verification counts, grouped. The same results as the "
+            "top-level fields, not a second computation."
+        ),
+    )
+    co_applicant: PartySection | None = Field(
+        None,
+        description=(
+            "**Absent entirely** on a single-applicant case. Present only "
+            "when the request supplied a second party."
+        ),
+    )
     errors: list[DocumentError] = Field(default_factory=list)
 
 
@@ -435,4 +719,6 @@ __all__ = [
     "SignatureFinding", "EvidenceRef", "KycSummary", "KycFieldResult",
     "KycFieldSource", "CrossDocument",
     "CrossDocumentCheck", "DocumentError",
+    "PartyProfileMatch", "ProfileFieldMatch", "ProfileMatchSource",
+    "PartySection", "PartyVerificationSummary",
 ]

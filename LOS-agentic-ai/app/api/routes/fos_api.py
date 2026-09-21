@@ -33,6 +33,8 @@ from app.agents.applicant import audit, config, permissions
 from app.agents.applicant.agent import AgentError, answer_question
 from app.agents.applicant.intents import Intent
 from app.agents.applicant.permissions import Caller, PermissionDenied
+from app.agents.applicant import followup
+from app.agents.applicant.query_types import QueryType as _QueryType
 from app.security.auth import require_jwt
 
 logger = logging.getLogger(__name__)
@@ -118,7 +120,23 @@ class ApplicationDetails(BaseModel):
         None, max_length=64, examples=["PERSONAL_LOAN"],
         description="Decides the document checklist. See GET /api/v1/fos/config.",
     )
-    loan_amount: float | str | None = Field(None, examples=[500000])
+    loan_amount: float | str | None = Field(
+        None, examples=[500000],
+        description=(
+            "Drives the amount-based document rules. Omit it and those "
+            "rules are reported as unevaluated in `policy."
+            "unevaluated_rules` rather than guessed at, so the checklist "
+            "is the base one and is known to be provisional."
+        ),
+    )
+    employment_type: str | None = Field(
+        None, max_length=64, examples=["SALARIED", "SELF_EMPLOYED"],
+        description=(
+            "An applicant attribute the document policy may key on. Not "
+            "defaulted: a rule that depends on it is reported as "
+            "unevaluated when it is absent."
+        ),
+    )
 
 
 class CreateCaseRequest(BaseModel):
@@ -159,6 +177,22 @@ class CopilotRequest(BaseModel):
         description="The question, for CUSTOM_QUERY. Ignored otherwise.",
         examples=["What documents are pending?"],
     )
+    context: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "The `context` block from the PREVIOUS response, echoed back "
+            "so a bare follow-up such as \"why?\" can be resolved.\n\n"
+            "This service holds no conversation state, so the caller "
+            "carries it. The context can only rewrite the message into "
+            "another question, which is then classified exactly as a typed "
+            "one is -- it selects no intent, names no case and skips no "
+            "permission check. When a follow-up is resolved, the response "
+            "says so in `followed_up`."
+        ),
+        examples=[{"last_query_type": "POLICY_REQUIREMENT",
+                   "last_intent": "DOCUMENTS_MISSING",
+                   "last_slot": "ADDRESS_PROOF"}],
+    )
 
 
 # ==========================================================================
@@ -197,7 +231,107 @@ class FosResponse(BaseModel):
         description="Mandatory slots for this product. Optional slots appear "
                     "in `checklist` with mandatory=false.",
     )
+    policy: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Where the checklist came from. Present whenever `checklist` "
+            "is.\n\n"
+            "- `policy_id`, `policy_version`, `status` — the configured "
+            "policy that produced the requirements. A `status` of "
+            "`UNCONFIRMED` means the thresholds in that file are "
+            "placeholders that no lender has signed off, and a UI should "
+            "say so rather than presenting them as policy.\n"
+            "- `applied_rules` — the rule ids that fired. Every checklist "
+            "row names its own in `rule_ids`.\n"
+            "- `unevaluated_rules` — rules that could NOT be decided "
+            "because the case has not captured what they key on (a loan "
+            "amount, an employment type). Their documents are **not** "
+            "imposed; each entry names the missing attribute and what the "
+            "rule would have required, so the checklist is known to be "
+            "provisional rather than appearing final.\n"
+            "- `pinned_version` / `version_changed` — the policy version "
+            "the case was opened under. This service resolves against the "
+            "current file; when it differs from the pin, `version_changed` "
+            "is true and `note` says so."
+        ),
+    )
     pending_items: list[dict[str, Any]] = Field(default_factory=list)
+
+    # ---- the frontend contract ------------------------------------------
+    #
+    # Derived from the fields above and from configuration. Nothing here is
+    # written by a language model, and nothing here decides an outcome --
+    # these are navigation aids, so a client does not have to re-implement
+    # (and drift from) what the service will actually permit.
+    query_type: str | None = Field(
+        None,
+        description=(
+            "What was ASKED FOR, as opposed to `category`, which says what "
+            "was CONSULTED. One of CASE_FACT, DOCUMENT_STATUS, "
+            "POLICY_REQUIREMENT, PROCESS_KNOWLEDGE, MIXED, ACTION_REQUEST, "
+            "DOWNSTREAM, CLARIFICATION."
+        ),
+        examples=["POLICY_REQUIREMENT"],
+    )
+    case_state: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Compact header state: counts of required, satisfied, missing, "
+            "under-review and failed documents, and `collection_progress` "
+            "over REQUIRED slots. Counted from the same checklist this "
+            "response carries. Null on an answer that did not read the "
+            "case."
+        ),
+    )
+    suggested_questions: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Follow-ups THIS case can answer, most blocking first. Built "
+            "from what is outstanding, never from a model, and never a "
+            "downstream question the stage would refuse."
+        ),
+    )
+    available_actions: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "What can be done now. Each entry has `action`, `label` and "
+            "`enabled`, plus `disabled_reason` when it is off. Disabled "
+            "rather than hidden, so the panel keeps its shape and says why."
+        ),
+    )
+    document_highlights: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "One card per document: `severity`, a one-line `headline` and "
+            "`primary_reason_code`. Reason codes are passed through from "
+            "verification, never rephrased."
+        ),
+    )
+    followed_up: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Set when a bare follow-up was expanded into a whole question. "
+            "Carries `original_message`, `interpreted_as` and `reason`, so "
+            "a misreading is visible instead of producing an answer that "
+            "does not match the question."
+        ),
+    )
+    context: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Echo this back as the request's `context` on the next "
+            "question so a follow-up can be resolved. This service holds "
+            "no conversation state; the caller carries it."
+        ),
+    )
+    clarification_required: dict[str, Any] | None = Field(
+        None,
+        description=(
+            "Set when the service declined to guess what was meant. "
+            "Carries a `question` and `options` the caller can pick from. "
+            "A null here is a claim that the request WAS understood."
+        ),
+    )
 
     verification: dict[str, Any] | None = Field(
         None,
@@ -287,6 +421,10 @@ def _blank(request_id: str, **overrides: Any) -> dict[str, Any]:
         "applicant_id": None, "case_id": None, "action": None, "intent": None,
         "answer": "", "applicant": None, "application": None, "stage": None,
         "documents": [], "checklist": [], "required_documents": [],
+        "policy": None,
+        "query_type": None, "case_state": None, "suggested_questions": [],
+        "available_actions": [], "document_highlights": [],
+        "clarification_required": None, "followed_up": None, "context": None,
         "pending_items": [], "verification": None, "kyc": None,
         "knowledge": None, "category": "CASE_ONLY", "next_action": None,
         "readiness": None, "actions": [], "route_to": None,
@@ -353,6 +491,7 @@ async def create_case(
         applicant_id=applicant_id,
         product=application_details.product,
         loan_amount=(str(amount) if amount is not None else None),
+        employment_type=application_details.employment_type,
         case_id=request.case_id,
     )
     if not application.ok:
@@ -370,7 +509,7 @@ async def create_case(
     audit.record(request_id=request_id, subject=caller.subject,
                  applicant_id=applicant_id, case_id=case_id,
                  intent="CREATE_CASE", tools=["applicant.create",
-                                              "application.create"],
+                        "application.create"],
                  write=True, confirmed=True, status="OK")
 
     logger.info("fos create_case request_id=%s applicant=%s case=%s product=%s",
@@ -393,9 +532,20 @@ async def create_case(
         documents=result.get("documents") or [],
         checklist=checklist,
         required_documents=_required_slots(checklist),
+        policy=result.get("policy"),
         pending_items=result.get("pending_items") or [],
         next_action=result.get("next_action"),
         readiness=result.get("readiness"),
+        query_type="CASE_FACT",
+        **_frontend_contract({"query_type": "CASE_FACT"}, {
+                              "applicant": result.get("applicant"),
+                              "application": result.get("application"),
+                              "stage": result.get("stage"),
+                              "documents": result.get("documents") or [],
+                              "checklist": checklist,
+                              "readiness": result.get("readiness"),
+                              "policy": result.get("policy"),
+        }),
     )
 
 
@@ -406,121 +556,121 @@ async def create_case(
 _COPILOT_BODY = {
     "required": True,
     "content": {
-        "application/json": {
-            "schema": {"$ref": "#/components/schemas/CopilotRequest"},
-            "examples": {
-                "ask_a_question": {
-                    "summary": "CUSTOM_QUERY — natural language",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "CUSTOM_QUERY",
-                        "message": "What documents are pending?",
+    "application/json": {
+    "schema": {"$ref": "#/components/schemas/CopilotRequest"},
+    "examples": {
+    "ask_a_question": {
+    "summary": "CUSTOM_QUERY — natural language",
+    "value": {
+    "applicant_id": "APP-3D51FFAC6342",
+    "case_id": "CASE-7DFE2F497522",
+    "action": "CUSTOM_QUERY",
+    "message": "What documents are pending?",
                     },
                 },
                 "documents": {
-                    "summary": "GET_DOCUMENTS — what has been uploaded",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "GET_DOCUMENTS",
+                "summary": "GET_DOCUMENTS — what has been uploaded",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "GET_DOCUMENTS",
                     },
                 },
                 "checklist": {
-                    "summary": "GET_DOCUMENT_CHECKLIST — what this product needs",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "GET_DOCUMENT_CHECKLIST",
+                "summary": "GET_DOCUMENT_CHECKLIST — what this product needs",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "GET_DOCUMENT_CHECKLIST",
                     },
                 },
                 "pending": {
-                    "summary": "GET_PENDING_ITEMS — everything outstanding",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "GET_PENDING_ITEMS",
+                "summary": "GET_PENDING_ITEMS — everything outstanding",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "GET_PENDING_ITEMS",
                     },
                 },
                 "next_action": {
-                    "summary": "GET_NEXT_ACTION — the one thing to do now",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "GET_NEXT_ACTION",
+                "summary": "GET_NEXT_ACTION — the one thing to do now",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "GET_NEXT_ACTION",
                     },
                 },
                 "case_360": {
-                    "summary": "GET_CASE_360 — the whole picture",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "GET_CASE_360",
+                "summary": "GET_CASE_360 — the whole picture",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "GET_CASE_360",
                     },
                 },
                 "readiness": {
-                    "summary": "CHECK_CPA_READINESS — may this go to CPA?",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "CHECK_CPA_READINESS",
+                "summary": "CHECK_CPA_READINESS — may this go to CPA?",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "CHECK_CPA_READINESS",
                     },
                 },
                 "out_of_scope": {
-                    "summary": "A downstream question — routed, not answered",
-                    "value": {
-                        "applicant_id": "APP-3D51FFAC6342",
-                        "case_id": "CASE-7DFE2F497522",
-                        "action": "CUSTOM_QUERY",
-                        "message": "Should we approve this loan?",
+                "summary": "A downstream question — routed, not answered",
+                "value": {
+                "applicant_id": "APP-3D51FFAC6342",
+                "case_id": "CASE-7DFE2F497522",
+                "action": "CUSTOM_QUERY",
+                "message": "Should we approve this loan?",
                     },
                 },
             },
         },
         "multipart/form-data": {
-            "schema": {
-                "type": "object",
-                "required": ["applicant_id", "case_id", "action"],
-                "properties": {
-                    "applicant_id": {"type": "string",
-                                     "example": "APP-3D51FFAC6342"},
-                    "case_id": {"type": "string",
-                                "example": "CASE-7DFE2F497522"},
-                    "action": {"type": "string", "enum": ["UPLOAD_DOCUMENT"],
-                               "example": "UPLOAD_DOCUMENT"},
-                    "files": {
-                        "type": "array",
-                        "items": {"type": "string", "format": "binary"},
-                        "description": (
-                            "One or more documents. In Swagger, press **Add "
-                            "string item** once per document and pick a file "
-                            "for each.\n\n"
-                            "Each file is classified and verified "
-                            "independently and gets its own entry in "
-                            "`verification.documents_processed`, so one bad "
-                            "file never stops the rest."
+        "schema": {
+        "type": "object",
+        "required": ["applicant_id", "case_id", "action"],
+        "properties": {
+        "applicant_id": {"type": "string",
+        "example": "APP-3D51FFAC6342"},
+        "case_id": {"type": "string",
+        "example": "CASE-7DFE2F497522"},
+        "action": {"type": "string", "enum": ["UPLOAD_DOCUMENT"],
+        "example": "UPLOAD_DOCUMENT"},
+        "files": {
+        "type": "array",
+        "items": {"type": "string", "format": "binary"},
+        "description": (
+        "One or more documents. In Swagger, press **Add "
+        "string item** once per document and pick a file "
+        "for each.\n\n"
+        "Each file is classified and verified "
+        "independently and gets its own entry in "
+        "`verification.documents_processed`, so one bad "
+        "file never stops the rest."
                         ),
                     },
                     "document_types": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "Optional, positional: the Nth value asserts the "
-                            "type of the Nth file. Omit the field entirely to "
-                            "let the pipeline classify everything, or leave "
-                            "an individual entry blank to classify just that "
-                            "file.\n\n"
-                            "Send it as repeated parts (one per file). A "
-                            "single comma-separated value "
-                            "(`PAN,DRIVING_LICENCE`) is also accepted, "
-                            "because some clients join array fields that "
-                            "way.\n\n"
-                            "An assertion is CHECKED, never applied: a file "
-                            "that is not the type claimed fails with "
-                            "DOCUMENT_TYPE_MISMATCH and is not silently "
-                            "reclassified. A checklist slot name such as "
-                            "ADDRESS_PROOF is accepted and resolves to the "
-                            "document types that satisfy it."
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                    "Optional, positional: the Nth value asserts the "
+                    "type of the Nth file. Omit the field entirely to "
+                    "let the pipeline classify everything, or leave "
+                    "an individual entry blank to classify just that "
+                    "file.\n\n"
+                    "Send it as repeated parts (one per file). A "
+                    "single comma-separated value "
+                    "(`PAN,DRIVING_LICENCE`) is also accepted, "
+                    "because some clients join array fields that "
+                    "way.\n\n"
+                    "An assertion is CHECKED, never applied: a file "
+                    "that is not the type claimed fails with "
+                    "DOCUMENT_TYPE_MISMATCH and is not silently "
+                    "reclassified. A checklist slot name such as "
+                    "ADDRESS_PROOF is accepted and resolves to the "
+                    "document types that satisfy it."
                         ),
                         "example": ["PAN", "DRIVING_LICENCE"],
                     },
@@ -547,12 +697,12 @@ _COPILOT_BODY = {
             # here too rather than only absorbed downstream.
             #
             # style/explode is the OpenAPI 3 way to say "one part per item".
-            "encoding": {
-                "files": {"style": "form", "explode": True},
-                "document_types": {
-                    "style": "form",
-                    "explode": True,
-                    "contentType": "text/plain",
+                                                        "encoding": {
+                                                        "files": {"style": "form", "explode": True},
+                                                        "document_types": {
+                                                        "style": "form",
+                                                        "explode": True,
+                                                        "contentType": "text/plain",
                 },
             },
         },
@@ -637,7 +787,7 @@ async def _copilot_json(
         raise HTTPException(415, detail={
             "request_id": request_id, "error": "UPLOAD_REQUIRES_MULTIPART",
             "message": ("UPLOAD_DOCUMENT requires multipart/form-data with a "
-                        "`file` part."),
+            "`file` part."),
         })
 
     if action is FosAction.CUSTOM_QUERY:
@@ -659,6 +809,10 @@ async def _copilot_json(
         # Only a typed question is pruned. A dropdown action is a screen and
         # keeps the fields that screen renders.
         concise=action is FosAction.CUSTOM_QUERY,
+        # A follow-up only makes sense for a typed question. A dropdown
+        # action is unambiguous by construction, and resolving one against
+        # a stale context would change what the button does.
+        context=(payload.context if action is FosAction.CUSTOM_QUERY else None),
     )
     return _from_agent(result, action.value, request_id,
                        concise=action is FosAction.CUSTOM_QUERY)
@@ -759,7 +913,7 @@ async def _copilot_upload(
         raise HTTPException(422, detail={
             "request_id": request_id, "error": "UNSUPPORTED_ACTION",
             "message": (f"{declared_action} is not valid for a multipart "
-                        "request. Only UPLOAD_DOCUMENT is."),
+            "request. Only UPLOAD_DOCUMENT is."),
         })
     if not applicant_id or not case_id:
         raise HTTPException(422, detail={
@@ -770,7 +924,7 @@ async def _copilot_upload(
         raise HTTPException(422, detail={
             "request_id": request_id, "error": "FILE_REQUIRED",
             "message": ("At least one file is required for UPLOAD_DOCUMENT. "
-                        "Send them as `files`."),
+            "Send them as `files`."),
         })
     if len(declared_types) > len(uploads):
         raise HTTPException(422, detail={
@@ -778,7 +932,7 @@ async def _copilot_upload(
             "message": (
                 f"{len(declared_types)} document_types were supplied for "
                 f"{len(uploads)} file(s). They are matched by position, so "
-                "there cannot be more types than files."
+                 "there cannot be more types than files."
             ),
         })
 
@@ -923,13 +1077,13 @@ async def _copilot_upload(
     audit.record(request_id=request_id, subject=caller.subject,
                  applicant_id=applicant_id, case_id=case_id,
                  intent="UPLOAD_DOCUMENT", tools=["los.process",
-                                                  "applicant.360"],
+                        "applicant.360"],
                  write=True, confirmed=True, status="OK")
 
     if len(outcomes) == 1:
         one = outcomes[0]
         doc_name = str(one.get("document_type") or "Document").replace(
-            "_", " ").title()
+                               "_", " ").title()
         answer = f"{doc_name} uploaded. Verification: {one['verification']}."
     else:
         answer = (
@@ -961,6 +1115,7 @@ async def _copilot_upload(
         documents=result.get("documents") or [],
         checklist=checklist,
         required_documents=_required_slots(checklist),
+        policy=result.get("policy"),
         pending_items=result.get("pending_items") or [],
         verification=verification,
         # Null on an upload, and deliberately.
@@ -972,6 +1127,19 @@ async def _copilot_upload(
         kyc=None,
         next_action=result.get("next_action"),
         readiness=result.get("readiness"),
+        # DOCUMENT_STATUS, not ACTION_REQUEST. The write has already
+        # happened by the time this is built; what the response describes
+        # is the state the documents are now in.
+        query_type="DOCUMENT_STATUS",
+        **_frontend_contract({"query_type": "DOCUMENT_STATUS"}, {
+                              "applicant": result.get("applicant"),
+                              "application": result.get("application"),
+                              "stage": result.get("stage"),
+                              "documents": result.get("documents") or [],
+                              "checklist": checklist,
+                              "readiness": result.get("readiness"),
+                              "policy": result.get("policy"),
+        }),
         processing_ms=round(float(los.get("processing_ms") or 0.0), 2),
     )
 
@@ -1016,6 +1184,7 @@ def _from_agent(
         documents=result.get("documents") or [],
         checklist=checklist,
         required_documents=_required_slots(checklist),
+        policy=result.get("policy"),
         pending_items=result.get("pending_items") or [],
         verification=verification,
         kyc=result.get("kyc"),
@@ -1026,9 +1195,17 @@ def _from_agent(
         actions=result.get("actions") or [],
         route_to=result.get("route_to"),
         response_source=result.get("response_source", "STRUCTURED"),
+        query_type=result.get("query_type"),
+        clarification_required=result.get("clarification_required"),
+        followed_up=result.get("followed_up"),
         processing_ms=result.get("processing_ms", 0.0),
         errors=result.get("errors") or [],
     )
+    envelope.update(_frontend_contract(result, envelope))
+    # Built from the COMPLETE envelope, before pruning: the slot a
+    # follow-up is most likely about comes from the checklist, which a
+    # typed question may not carry in its response.
+    envelope["context"] = followup.context_from_response(envelope)
 
     # A TYPED QUESTION GETS ONLY WHAT IT ASKED ABOUT.
     #
@@ -1055,6 +1232,42 @@ def _from_agent(
                               enabled=True)
 
     return envelope
+
+
+def _frontend_contract(result: dict[str, Any],
+                       envelope: dict[str, Any]) -> dict[str, Any]:
+    """
+    The UI fields, computed BEFORE the envelope is pruned.
+
+    ORDER MATTERS HERE. Pruning drops the case fields a typed question did
+    not ask about, and `case_state` counts documents out of the checklist.
+    Computed after pruning, a question about applicant details would report
+    a case with zero required documents -- a header that contradicts the
+    screen it sits above. So it is computed from the complete data and
+    survives the prune as its own field.
+
+    A KNOWLEDGE OR ROUTED ANSWER GETS NO STATE. Neither read the case, and
+    a header stating counts for a case the answer never looked at would be
+    the same overreach the routing boundary exists to prevent.
+    """
+    from app.agents.applicant import frontend
+    from app.agents.applicant.query_types import READS_CASE, QueryType
+
+    raw = result.get("query_type")
+    try:
+        query_type = QueryType(raw) if raw else None
+    except ValueError:
+        query_type = None
+
+    reads_case = query_type in READS_CASE if query_type else False
+    block = frontend.contract(envelope, include_state=reads_case)
+
+    # A clarification carries its own options as the suggestions -- the
+    # case-derived ones would be answers to a question nobody asked.
+    suggested = result.get("suggested_questions")
+    if suggested:
+        block["suggested_questions"] = list(suggested)
+    return block
 
 
 def _raise_from(request_id: str, envelope) -> None:
@@ -1111,9 +1324,30 @@ async def actions(claims: dict[str, Any] = Depends(require_jwt)):
     ),
 )
 async def fos_config(claims: dict[str, Any] = Depends(require_jwt)):
-    from app.agents.applicant.config import _section
+    from app.agents.policy import loader as policy_loader
 
-    products = sorted(k for k in _section("documents") if k != "default")
+    # Products from BOTH sources. A product described by a policy file and
+    # not by the agent config was missing from this list, so a frontend
+    # built its product picker without it while the copilot answered
+    # questions about it perfectly well.
+    products = [p for p in config.products() if p != "default"]
+
+    policies = {}
+    for product in policy_loader.known_products():
+        document = policy_loader.policy_for(product) or {}
+        policies[product] = {
+            "policy_id": document.get("policy_id"),
+            "policy_version": document.get("policy_version"),
+            "status": document.get("status"),
+            # What a form needs to know it should capture, because leaving
+            # it out makes the checklist provisional.
+            "keys_on": sorted({
+                str(key).lower()
+                for rule in (document.get("conditional_rules") or [])
+                for key in (rule.get("when") or {})
+            } | ({"loan_amount"} if document.get("amount_rules") else set())),
+        }
+
     return {
         "products": products,
         "document_types": config.document_types(),
@@ -1123,6 +1357,38 @@ async def fos_config(claims: dict[str, Any] = Depends(require_jwt)):
         },
         "default_checklist": config.checklist_for(None),
         "downstream_routes": sorted(config.routing_table()),
+        # The product-level checklist above is what EVERY application for
+        # the product needs. A case's own list depends on its amount and
+        # attributes; these say which ones matter.
+        "policies": policies,
+        "query_types": [t.value for t in _QueryType],
+    }
+
+
+@router.get(
+    "/tools",
+    summary="The MCP tool catalogue",
+    description=(
+        "Every tool the copilot can call, with its JSON Schema, the scope "
+        "required to call it, and whether it writes. Published so the "
+        "boundary is reviewable rather than inferred from source.\n\n"
+        "The scope shown is the one the permission layer enforces; a test "
+        "checks the two agree.\n\n"
+        "*Supporting endpoint — not part of the two-endpoint integration "
+        "surface.*"
+    ),
+)
+async def fos_tools(claims: dict[str, Any] = Depends(require_jwt)):
+    from app.mcp import contracts
+
+    return {
+        "tools": [
+            {**entry,
+             "required_scope": contracts.required_scope(entry["name"]),
+             "writes": contracts.CONTRACTS[entry["name"]].writes}
+            for entry in contracts.catalogue()
+        ],
+        "never_answered_here": list(contracts.DOWNSTREAM_CONCERNS),
     }
 
 

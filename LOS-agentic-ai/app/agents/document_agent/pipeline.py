@@ -23,7 +23,12 @@ from app.agents.document_agent.fields.dl import extract_dl_fields
 from app.agents.document_agent.fields.passport import extract_passport_fields
 from app.agents.document_agent.fields.voter import extract_voter_fields
 from app.agents.document_agent.fields.pan import extract_pan_fields
-from app.agents.document_agent import name_spacing, preprocess
+from app.agents.document_agent import (
+    name_spacing,
+    preprocess,
+    preprocess_plan,
+    quality,
+)
 from app.agents.document_agent.ocr import get_engine
 from app.agents.document_agent.schemas import (
     DocumentExtractionResult,
@@ -701,6 +706,14 @@ class Recognition:
     engine_name: str = ""
     passes: int = 0
     labels: list[str] = field(default_factory=list)
+    #: What the image quality analysis measured on the ORIGINAL image.
+    #:
+    #: Carried on the recognition because verification needs it and
+    #: re-measuring downstream would analyse whichever variant happened to
+    #: win -- a deskewed, contrast-boosted copy is not the thing the
+    #: customer uploaded, and reporting its quality would describe our own
+    #: preprocessing back to them.
+    quality: Any = None
 
 
 def recognise(
@@ -792,12 +805,58 @@ def recognise(
 
         return candidate
 
+    # WHAT IS WRONG WITH THE IMAGE, measured once, before any OCR.
+    #
+    # Used for two things and nothing else: choosing which recovery
+    # transforms are worth trying, and explaining a document that does not
+    # pass. It cannot fail a document -- see quality.py. Measuring costs a
+    # few milliseconds of OpenCV on an image already in memory, against an
+    # OCR pass that costs one to two seconds, so it pays for itself the
+    # first time it lets one be skipped.
+    report = quality.analyse(image)
+    if not report.analysed:
+        logger.debug("Image quality analysis unavailable; using legacy passes")
+
     current = attempt("standard", preprocess.standard(image))
 
     if escalate:
-        # Contrast/upscale recovery, only when the standard pass fell short.
+        # TARGETED RECOVERY, only when the standard pass fell short, and
+        # only for defects that were actually measured.
+        #
+        # This used to be one unconditional `enhance` -- upscale, grayscale
+        # and global autocontrast together, whatever had gone wrong. A
+        # clean colour card lost the colour channel the detector uses; a
+        # merely-small image got a contrast stretch it did not need.
+        #
+        # Each variant below addresses one finding, and the loop STOPS at
+        # the first pass good enough to satisfy the caller. An image with
+        # no findings produces an empty plan and pays for nothing.
         if current is None or not satisfied(current):
-            enhanced = attempt("enhanced", preprocess.enhance(image))
+            for variant in preprocess_plan.plan(report):
+                try:
+                    candidate = attempt(variant.label, variant.build(image))
+                except Exception:
+                    # A transform that fails costs its own variant and
+                    # nothing else. The document still has every other
+                    # route to being read.
+                    logger.warning(
+                        "Preprocessing variant '%s' failed", variant.label,
+                        exc_info=True,
+                    )
+                    continue
+
+                if candidate is not None and satisfied(candidate):
+                    current = candidate
+                    break
+
+        # THE LEGACY COMBINED PASS, as a safety net rather than a first
+        # response. It runs when the targeted variants did not recover the
+        # document, and when quality analysis was unavailable -- so an
+        # environment without OpenCV behaves exactly as it did before, and
+        # this change can only add recoveries, never remove one.
+        if current is None or not satisfied(current):
+            legacy = preprocess_plan.fallback()
+            enhanced = attempt(legacy.label, legacy.build(image))
 
             if enhanced is not None and satisfied(enhanced):
                 current = enhanced
@@ -843,6 +902,7 @@ def recognise(
     best.result.processing.processed_height = telemetry["processed_height"]
     best.result.processing.ocr_thread = telemetry["ocr_thread"]
     best.result.processing.ocr_passes = telemetry["ocr_passes"]
+    best.quality = report
 
     return best
 
