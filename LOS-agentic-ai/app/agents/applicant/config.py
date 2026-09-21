@@ -52,10 +52,24 @@ def _load() -> dict[str, Any]:
 
 
 def reload() -> None:
-    """Drop the cache. For tests and for an explicit reconfiguration."""
+    """
+    Drop the cache. For tests and for an explicit reconfiguration.
+
+    THE POLICY CACHE GOES WITH IT. `checklist_for` now resolves through
+    the policy engine, so reloading this file alone left half the
+    configuration stale -- a reconfiguration that changed a product's
+    documents would take effect for some callers and not others, which is
+    worse than not reloading at all.
+    """
     global _CACHE
     with _LOCK:
         _CACHE = None
+    try:
+        from app.agents.policy import loader as policy_loader
+
+        policy_loader.reload()
+    except Exception:  # pragma: no cover - import failure
+        logger.exception("Could not reload the document policies")
 
 
 def _section(name: str) -> dict[str, Any]:
@@ -117,10 +131,27 @@ def products() -> list[str]:
 
     Used to answer taxonomy-wide questions -- what does slot X accept
     anywhere -- without a caller having to guess the product names.
+
+    BOTH SOURCES. A product may be described by a policy file, by this
+    file, or by both. Leaving the policy products out meant a question
+    naming a product that had been moved to a policy file stopped
+    recognising it, and the question was answered from the `default`
+    checklist instead -- a shorter list, presented with no sign that it was
+    the wrong one.
     """
-    documents = _section("documents")
-    return [str(key).upper() if key != "default" else "default"
-            for key in documents]
+    from app.agents.policy import loader as policy_loader
+
+    names = [str(key).upper() if key != "default" else "default"
+             for key in _section("documents")]
+    try:
+        declared = policy_loader.known_products()
+    except Exception:  # pragma: no cover - configuration failure
+        logger.exception("Could not list the configured policies")
+        declared = []
+    for product in declared:
+        if product not in names:
+            names.append(product)
+    return names
 
 
 def checklist_for(product: str | None) -> list[dict[str, Any]]:
@@ -133,9 +164,45 @@ def checklist_for(product: str | None) -> list[dict[str, Any]]:
     been collected should be visible, and one that has not should not be
     mistaken for a blocker.
 
+    THE POLICY FILE WINS WHERE THERE IS ONE, and this is the whole reason
+    the delegation exists. Two configuration files describing the same
+    product will eventually disagree, and when they did, the /config
+    endpoint advertised one checklist while a real case was measured
+    against another. There is one resolution path now; this is a view onto
+    it.
+
+    NO LOAN AMOUNT IS ASSUMED. This is the PRODUCT-level answer -- what
+    every application for this product needs, whatever the amount. A case's
+    own checklist comes from `workflow.resolution_for`, which has the
+    amount and the applicant's attributes. Defaulting an amount here would
+    put a band's documents into the answer to "what does a personal loan
+    need?", which is a question about the product.
+
     Falls back to `default` when the product is unset or unknown, so a case
     that has not chosen a product still has something to be measured against
     rather than appearing complete by accident.
+    """
+    from app.agents.policy import engine as policy
+
+    try:
+        resolution = policy.resolve(product)
+    except Exception:  # pragma: no cover - configuration failure
+        logger.exception("Policy resolution failed for %s", product)
+    else:
+        if resolution.policy_id != policy.LEGACY_POLICY_ID:
+            return [{"slot": r.slot, "accepts": list(r.accepts),
+                     "mandatory": r.mandatory}
+                    for r in resolution.requirements]
+
+    return _checklist_from_yaml(product)
+
+
+def _checklist_from_yaml(product: str | None) -> list[dict[str, Any]]:
+    """
+    The checklist as declared in this file.
+
+    Called directly by the policy engine's fallback, so it must not
+    delegate back to `checklist_for`.
     """
     documents = _section("documents")
     key = (product or "").strip().upper()

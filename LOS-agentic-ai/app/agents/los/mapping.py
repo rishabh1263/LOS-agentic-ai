@@ -59,7 +59,14 @@ def _first(fields: dict[str, Any], names: tuple[str, ...]) -> Any:
     return None
 
 
-def _address(fields: dict[str, Any]) -> AddressInput | None:
+def address_input(fields: dict[str, Any]) -> AddressInput | None:
+    """
+    An address assembled from extracted fields.
+
+    Public because profile matching builds the same thing from the same
+    fields. A second builder would be a second answer to "which keys hold
+    an address", and the two would drift.
+    """
     raw = fields.get("address")
     pincode = fields.get("pin_code") or fields.get("pincode")
 
@@ -160,7 +167,7 @@ def to_kyc_source(
             father_name=_first(fields, _FATHER_NAME_FIELDS),
             date_of_birth=fields.get("date_of_birth"),
             pan=_first(fields, _PAN_FIELDS),
-            address=_address(fields),
+            address=address_input(fields),
             income=_income(fields),
             field_quality=_quality(response),
         )
@@ -176,4 +183,4 @@ def to_kyc_source(
         return None
 
 
-__all__ = ["to_kyc_source"]
+__all__ = ["to_kyc_source", "address_input"]

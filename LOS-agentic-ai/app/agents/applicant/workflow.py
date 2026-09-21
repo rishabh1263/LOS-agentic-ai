@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agents.applicant import config
+from app.agents.policy import engine as policy
 from app.store.models import (
     ACTIONABLE_STATUSES,
     Applicant,
@@ -32,49 +33,131 @@ from app.store.models import (
 # ==========================================================================
 
 
+#: How a stored document status reads as a CHECKLIST state.
+#:
+#: TWO AXES, NOT ONE. A checklist row answers two separate questions -- how
+#: strongly the case needs this slot (`requirement`: REQUIRED, CONDITIONAL,
+#: OPTIONAL, NOT_APPLICABLE) and how far it has got (`fulfilment`). Folding
+#: them into a single field forces a choice between displaying "REQUIRED" and
+#: "SATISFIED" for a row that is both, and a frontend then cannot render a
+#: required-and-still-missing slot differently from an optional one.
+#:
+#: `status` stays exactly as it was: the stored document status, or MISSING.
+#: Existing callers read it and nothing here moves it.
+SATISFIED = "SATISFIED"
+MISSING = "MISSING"
+UNDER_REVIEW = "UNDER_REVIEW"
+FAILED = "FAILED"
+IN_PROGRESS = "IN_PROGRESS"
+
+_FULFILMENT = {
+    DocumentStatus.VERIFIED: SATISFIED,
+    DocumentStatus.REVIEW: UNDER_REVIEW,
+    DocumentStatus.REJECTED: FAILED,
+    # Collected, not yet concluded. Neither satisfied nor missing, and
+    # calling it either would misreport the case: "satisfied" invites a
+    # handoff that verification has not cleared, "missing" sends a field
+    # officer back for a document the customer already handed over.
+    DocumentStatus.PROCESSING: IN_PROGRESS,
+    DocumentStatus.UPLOADED: IN_PROGRESS,
+}
+
+
+def resolution_for(application: Application | None):
+    """
+    The policy resolution behind this case's checklist.
+
+    Separate from `build_checklist` because the resolution carries things a
+    checklist row cannot: which rules fired, which could not be evaluated,
+    and the policy version the whole answer came from.
+    """
+    return policy.resolve(
+        application.product if application else None,
+        loan_amount=application.loan_amount if application else None,
+        attributes=(application.policy_attributes() if application else {}),
+    )
+
+
 def build_checklist(
     application: Application | None,
     documents: list[Document],
+    resolution=None,
 ) -> list[dict[str, Any]]:
     """
     The required-document checklist for this case, with what satisfies each.
 
-    One entry per required slot. A slot is either a single document type or an
-    `any_of` group where one of several types will do -- address proof being
-    the usual case, where a licence and a passport are equally good evidence.
+    One entry per slot. A slot is either a single document type or a group
+    where one of several types will do -- address proof being the usual
+    case, where a licence and a passport are equally good evidence.
+
+    WHERE THE SLOTS COME FROM. The policy engine, which resolves them from
+    the product, the loan amount and the case's own attributes. A product
+    with no policy file resolves through the agent checklist exactly as it
+    did before the engine existed, so this is a widening, not a change of
+    answer.
     """
-    slots = config.checklist_for(application.product if application else None)
+    resolution = resolution if resolution is not None else resolution_for(application)
+
     by_type: dict[str, list[Document]] = {}
     for document in documents:
         by_type.setdefault((document.document_type or "").upper(), []).append(document)
 
-    return [
-        _slot(entry["slot"], entry["accepts"], by_type, entry["mandatory"])
-        for entry in slots
-    ]
+    return [_slot(requirement, by_type, resolution)
+            for requirement in resolution.requirements]
 
 
 def _slot(
-    slot: str,
-    accepts: list[str],
+    requirement,
     by_type: dict[str, list[Document]],
-    mandatory: bool = True,
+    resolution=None,
 ) -> dict[str, Any]:
     """One checklist row: what satisfies it, and what state it is actually in."""
+    accepts = list(requirement.accepts)
+    row: dict[str, Any] = {
+        "slot": requirement.slot,
+        "accepts": accepts,
+        "mandatory": requirement.mandatory,
+        # -- why the case needs it, straight from the rule that said so
+        "requirement": requirement.requirement,
+        "rule_ids": list(requirement.rule_ids),
+        "reason": requirement.reason,
+        "policy_status": requirement.policy_status,
+    }
+    if requirement.applicable_conditions:
+        row["applicable_conditions"] = list(requirement.applicable_conditions)
+
+    # WHAT HAS TO BE READABLE ON THE DOCUMENT, per accepted type.
+    #
+    # Published, not enforced here. Verification decides whether a
+    # document is any good and this module does not second-guess it; what
+    # this adds is that a field officer can be told "a bank statement
+    # needs to show its period" BEFORE they collect one, rather than
+    # finding out from a rejection afterwards.
+    #
+    # Sourced from the policy file, so a lender changing what it wants to
+    # see does not require a release.
+    if resolution is not None:
+        content = {
+            accepted: resolution.evidence_for(accepted)
+            for accepted in accepts
+            if resolution.evidence_for(accepted)
+        }
+        if content:
+            row["content_requirements"] = content
+
     matched: list[Document] = []
     for accepted in accepts:
         matched.extend(by_type.get(accepted, []))
 
     if not matched:
-        return {
-            "slot": slot,
-            "accepts": accepts,
-            "mandatory": mandatory,
-            "status": "MISSING",
+        row.update({
+            "status": MISSING,
+            "fulfilment": MISSING,
             "document_type": None,
             "document_id": None,
             "reason_codes": [],
-        }
+        })
+        return row
 
     # The best one wins. A rejected first attempt followed by a verified
     # re-upload is a satisfied slot, not a blocked one.
@@ -87,15 +170,14 @@ def _slot(
     }
     best = sorted(matched, key=lambda d: ranking.get(d.status, 9))[0]
 
-    return {
-        "slot": slot,
-        "accepts": accepts,
-        "mandatory": mandatory,
+    row.update({
         "status": best.status.value,
+        "fulfilment": _FULFILMENT.get(best.status, IN_PROGRESS),
         "document_type": best.document_type,
         "document_id": best.document_id,
         "reason_codes": list(best.reason_codes or []),
-    }
+    })
+    return row
 
 
 # ==========================================================================

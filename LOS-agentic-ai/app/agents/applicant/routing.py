@@ -88,6 +88,9 @@ RELEVANT_FIELDS: dict[Intent, tuple[str, ...]] = {
                                "required_documents"),
     Intent.DOCUMENTS_UPLOADED: ("documents",),
     Intent.DOCUMENTS_REQUIRED: ("checklist", "required_documents"),
+    # The explanation IS the policy block, so the answer would be
+    # unsupportable without it.
+    Intent.POLICY_EXPLANATION: ("checklist", "required_documents"),
     Intent.DOCUMENTS_MISSING: ("checklist", "required_documents",
                                "pending_items"),
     Intent.DOCUMENTS_PENDING: ("pending_items",),
@@ -121,6 +124,13 @@ ALWAYS_KEPT = frozenset({
     "request_id", "applicant_id", "case_id", "action", "intent", "answer",
     "category", "knowledge", "route_to", "response_source", "processing_ms",
     "errors", "actions",
+    # Conversation plumbing and UI affordances, not case data. Pruning
+    # these would remove the fields a chat client needs MOST -- a typed
+    # question is exactly the case where the follow-up context and the
+    # suggestions matter.
+    "query_type", "case_state", "suggested_questions", "available_actions",
+    "document_highlights", "clarification_required", "followed_up",
+    "context",
 })
 
 
@@ -150,8 +160,16 @@ def relevant_fields(
 PRUNABLE = (
     "applicant", "application", "stage", "documents", "checklist",
     "required_documents", "pending_items", "verification", "kyc",
-    "next_action", "readiness",
+    "next_action", "readiness", "policy",
 )
+
+#: Fields that follow another field rather than standing alone.
+#:
+#: `policy` explains where the checklist came from. Keeping it on an answer
+#: with no checklist is noise; dropping it from an answer WITH one leaves a
+#: requirement the caller cannot trace to a rule, which is the thing the
+#: policy block exists to prevent.
+FOLLOWS = {"policy": "checklist"}
 
 
 def prune(
@@ -185,6 +203,7 @@ def prune(
         return envelope
 
     kept = set(keep) | ALWAYS_KEPT
+    kept |= {follower for follower, leader in FOLLOWS.items() if leader in kept}
     pruned = {k: v for k, v in envelope.items()
               if k not in PRUNABLE or k in kept}
 
@@ -198,6 +217,6 @@ def prune(
 
 
 __all__ = [
-    "ALWAYS_KEPT", "QueryCategory", "RELEVANT_FIELDS", "ResponseSource",
-    "category_for", "prune", "relevant_fields",
+    "ALWAYS_KEPT", "FOLLOWS", "QueryCategory", "RELEVANT_FIELDS",
+    "ResponseSource", "category_for", "prune", "relevant_fields",
 ]

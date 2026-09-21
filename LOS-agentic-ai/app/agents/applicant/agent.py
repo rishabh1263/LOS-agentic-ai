@@ -34,6 +34,8 @@ from app.agents.applicant import (
     routing,
 )
 from app.agents.applicant.answer import deterministic_answer, generate_answer
+from app.agents.applicant import followup
+from app.agents.applicant.query_types import QueryType, clarification_for, type_for
 from app.agents.applicant.intents import (
     Intent,
     SIMPLE_INTENTS,
@@ -170,6 +172,7 @@ async def answer_question(
     claims: dict[str, Any],
     request_id: str | None = None,
     concise: bool = True,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     One FOS question, answered.
@@ -197,6 +200,9 @@ async def answer_question(
             "stage": None,
             "documents": [],
             "checklist": [],
+            # Which policy produced the checklist, and which rules fired.
+            # Always alongside it, never instead of it.
+            "policy": None,
             "pending_items": [],
             "next_action": None,
             "readiness": None,
@@ -209,6 +215,25 @@ async def answer_question(
             # tell "the store answered it" from "the handbook did" without
             # inferring it from which fields happen to be populated.
             "category": routing.QueryCategory.CASE_ONLY.value,
+            # WHAT WAS ASKED FOR, as opposed to what was consulted. See
+            # app/agents/applicant/query_types.py for why both exist.
+            "query_type": QueryType.CASE_FACT.value,
+            # -- the frontend contract. Derived, never phrased by a model.
+            "case_state": None,
+            "suggested_questions": [],
+            "available_actions": [],
+            "document_highlights": [],
+            # Present ONLY when the service declined to guess. A null here
+            # is a claim that the request was understood.
+            "clarification_required": None,
+            # What a bare follow-up was taken to mean, when one was
+            # resolved. Reported so a misunderstanding is visible rather
+            # than leaving an officer wondering why the answer does not
+            # match the question.
+            "followed_up": None,
+            # The block the caller echoes back on the next question. This
+            # service holds no conversation state.
+            "context": None,
             "base_intent": None,
             "route_to": None,
             "response_source": routing.ResponseSource.STRUCTURED.value,
@@ -230,6 +255,17 @@ async def answer_question(
                      "message": "The Applicant Agent is disabled."}],
         )
 
+    # A BARE FOLLOW-UP BECOMES A WHOLE QUESTION FIRST.
+    #
+    # The rewrite produces a MESSAGE, which is then classified by exactly
+    # the same patterns as anything typed by a person. It selects no
+    # intent, reaches no tool and skips no check -- see
+    # app/agents/applicant/followup.py for why that boundary is where it
+    # is, given the context comes from the caller.
+    resolution = followup.resolve(
+        message, followup.Context.from_payload(context))
+    message = resolution.message
+
     classification = classify(message)
     intent = classification.intent
 
@@ -243,6 +279,8 @@ async def answer_question(
         return envelope(
             intent=intent.value,
             category=routing.QueryCategory.DOWNSTREAM.value,
+            query_type=QueryType.DOWNSTREAM.value,
+            followed_up=resolution.public(),
             response_source=routing.ResponseSource.ROUTED.value,
             route_to=route.get("route_to", classification.route_to),
             answer=route.get(
@@ -265,6 +303,8 @@ async def answer_question(
                      message=message)
         return envelope(intent=intent.value, answer=text,
                         category=routing.QueryCategory.KNOWLEDGE_ONLY.value,
+                        query_type=QueryType.PROCESS_KNOWLEDGE.value,
+                        followed_up=resolution.public(),
                         response_source=source,
                         knowledge=_public_knowledge(detail))
 
@@ -273,7 +313,17 @@ async def answer_question(
         # chance before the agent gives up, and its own confidence threshold
         # decides. A phrase list can always be out of date; retrieval scoring
         # degrades gracefully instead of failing at an exact wording.
-        text, source, detail = await _knowledge_reply(message)
+        #
+        # EXCEPT FOR AN UNRESOLVED FOLLOW-UP. "why?" is not a question about
+        # the FOS handbook, but retrieval scored it confident and answered
+        # it with a paragraph about document states. A message that only
+        # means something in context, and whose context did not resolve,
+        # goes straight to the clarification.
+        bare = followup.is_bare(message)
+        text, source, detail = (
+            ("", "", {"confident": False}) if bare
+            else await _knowledge_reply(message)
+        )
         if detail["confident"]:
             audit.record(request_id=request_id, subject=caller.subject,
                          applicant_id=applicant_id, case_id=case_id,
@@ -281,6 +331,8 @@ async def answer_question(
                          tools=["knowledge.fos"], status="OK", message=message)
             return envelope(intent=Intent.FOS_KNOWLEDGE.value, answer=text,
                             category=routing.QueryCategory.KNOWLEDGE_ONLY.value,
+                            query_type=QueryType.PROCESS_KNOWLEDGE.value,
+                            followed_up=resolution.public(),
                             response_source=source,
                             knowledge=_public_knowledge(detail))
 
@@ -288,15 +340,23 @@ async def answer_question(
                      applicant_id=applicant_id, case_id=case_id,
                      intent=intent.value, tools=[], status="UNSUPPORTED",
                      message=message)
+        # A QUESTION BACK, NOT A DEAD END. The request was not understood
+        # and the service will not guess -- but "could you rephrase?" puts
+        # the work back on the officer with no help. The clarification
+        # carries what this desk can answer, so the next click succeeds.
+        #
+        # The error stays. A caller distinguishing "answered" from "not
+        # answered" reads `errors`, and dropping it to make the response
+        # look friendlier would make an unanswered question look answered.
+        clarification = clarification_for(message, has_case=bool(case_id))
         return envelope(
             intent=intent.value,
             category=routing.QueryCategory.UNSUPPORTED.value,
-            answer=(
-                "I can help with applicant details, application status, "
-                "documents and verification, what is pending, the next "
-                "action, and whether the case is ready for CPA. "
-                "Could you rephrase?"
-            ),
+            query_type=QueryType.CLARIFICATION.value,
+            clarification_required=clarification,
+            followed_up=resolution.public(),
+            suggested_questions=list(clarification["options"]),
+            answer=clarification["question"],
             errors=[{"code": "UNSUPPORTED_REQUEST",
                      "message": "The request was not understood."}],
         )
@@ -322,6 +382,8 @@ async def answer_question(
                      confirmed=False, status="PROPOSED", message=message)
         return envelope(
             intent=intent.value,
+            query_type=QueryType.ACTION_REQUEST.value,
+            followed_up=resolution.public(),
             answer=f"{action['summary'].rstrip('.')}. Please confirm and I will apply it.",
             actions=[action],
         )
@@ -411,6 +473,12 @@ async def answer_question(
     payload = _shape(results)
     response = envelope(
         intent=intent.value,
+        # The kind of request, resolved from the intent the classifier
+        # settled on -- including MIXED, whose case half decides nothing
+        # here: a mixed question is its own kind because a UI renders the
+        # two halves differently.
+        query_type=type_for(intent).value,
+        followed_up=resolution.public(),
         # The case intent under a MIXED answer. The public boundary prunes
         # with it, because a mixed answer is about whatever its case half was
         # about.
@@ -569,6 +637,7 @@ def _shape(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
             "stage": view.get("stage"),
             "documents": view.get("documents") or [],
             "checklist": view.get("checklist") or [],
+            "policy": view.get("policy"),
             "pending_items": view.get("pending_items") or [],
             "next_action": view.get("next_action"),
             "readiness": view.get("readiness"),
@@ -584,6 +653,7 @@ def _shape(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
         out["documents"] = results["documents.get"].get("documents") or []
     if "documents.checklist" in results:
         out["checklist"] = results["documents.checklist"].get("checklist") or []
+        out["policy"] = results["documents.checklist"].get("policy")
     if "documents.verification" in results:
         payload = results["documents.verification"]
         if payload.get("found"):

@@ -32,7 +32,7 @@ from typing import Any, Iterable
 
 from app.agents.document_agent.workflow import process_document
 from app.agents.los import config as los_config
-from app.agents.los import response
+from app.agents.los import parties, response
 from app.agents.kyc.agent import check_is_blocking, run_kyc
 from app.agents.kyc.schemas import CheckStatus, KycRequest
 from app.agents.los.mapping import to_kyc_source
@@ -147,9 +147,16 @@ def document_mode(operation: str | None) -> str:
 
 
 class UploadedDocument:
-    """One file offered to the flow."""
+    """
+    One file offered to the flow, and whose it is.
 
-    __slots__ = ("source_id", "filename", "content", "expected_type")
+    `party` is optional and defaults to None, so every existing caller
+    keeps working unchanged: a document with no party is the primary
+    applicant's, which is what a single-party case always meant. The flow
+    stamps it before processing.
+    """
+
+    __slots__ = ("source_id", "filename", "content", "expected_type", "party")
 
     def __init__(
         self,
@@ -157,11 +164,13 @@ class UploadedDocument:
         filename: str,
         content: bytes,
         expected_type: str | None = None,
+        party=None,
     ) -> None:
         self.source_id = source_id
         self.filename = filename
         self.content = content
         self.expected_type = expected_type
+        self.party = party
 
 
 
@@ -301,6 +310,46 @@ def _specialist_disabled(
     }
 
 
+def _specialist_scores(
+    expected: str | None, result: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Score and confidence for a specialist's verdict, from its own checks.
+
+    Empty when the capability reported no checks -- there is nothing to
+    weigh, and a score computed from no evidence would be a number with
+    no meaning behind it. Absent is the honest answer.
+
+    Never raises: a capability must not fail to return because its result
+    could not be scored.
+    """
+    try:
+        from app.agents.verification import scoring
+
+        checks = scoring.from_named(result.get("checks") or [])
+        if not checks:
+            return {}
+
+        assessment = scoring.assess(
+            str(expected or "SPECIALIST").upper(), checks,
+        )
+        published = assessment.public()
+        # NUMBERS ONLY. The scoring layer also produces sentences, and
+        # publishing them here was actively wrong: its checks are named
+        # after the capability's internal steps, so a sale deed carrying
+        # four precise codes -- PARTY_MISSING, CONSIDERATION_MISSING and
+        # two more -- had all four sentences replaced by one generic
+        # "verification checks could not be completed". The response
+        # boundary derives the prose from the real reason codes instead.
+        return {
+            "verification_score": published["verification_score"],
+            "verification_confidence": published["verification_confidence"],
+        }
+    except Exception:  # pragma: no cover - scoring must never break a call
+        logger.exception("Specialist scoring failed")
+        return {}
+
+
 async def _run_specialist(
     document: UploadedDocument,
     agent_id: str,
@@ -369,6 +418,16 @@ async def _run_specialist(
                 "decision": result.get("decision"),
                 "checks": result.get("checks") or [],
                 "reason_codes": result.get("reason_codes") or [],
+                # A specialist reported a verdict and its checks, and no
+                # numbers -- a sale deed came back REVIEW with four reason
+                # codes, `verification_score: null` and nothing to rank it
+                # against other documents in the same queue.
+                #
+                # THE VERDICT IS UNTOUCHED. `decision` above is still the
+                # capability's own, and the scoring module's status is
+                # discarded: these are the two numbers that describe that
+                # verdict, not a second opinion about it.
+                **_specialist_scores(expected, result),
             },
             "evidence_refs": result.get("evidence_refs") or [],
             "specialist": result,
@@ -578,6 +637,503 @@ def _aggregate_timings(documents: list[dict[str, Any]]) -> dict[str, float]:
     return {key: round(value, 2) for key, value in totals.items()}
 
 
+def _match_profiles(
+    *,
+    documents: list[dict[str, Any]],
+    primary,
+    co_applicant,
+    applicant_profile: dict[str, Any] | None,
+    co_applicant_profile: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """
+    One profile match per party, each over that party's own documents.
+
+    ONE FUNCTION, BOTH PARTIES. The loop below is the whole of the
+    co-applicant support: the same matcher, the same filter, a different
+    party. A second path for the second person is a second place for the
+    isolation to be got wrong.
+
+    Never raises: profile matching is additional evidence, and a failure
+    to produce it must not cost the caller the verdicts they asked for.
+    """
+    from app.agents.los import profile_match
+
+    matches: list[dict[str, Any]] = []
+
+    wanted = [(primary, applicant_profile)]
+    if co_applicant is not None:
+        wanted.append((co_applicant, co_applicant_profile))
+
+    for party, supplied in wanted:
+        try:
+            profile = profile_match.merged(
+                profile_match.from_request(**(supplied or {})),
+                _stored_profile_for(party.party_id),
+            )
+            if profile.is_empty():
+                # Nothing declared and nothing on file. There is no
+                # profile to match, which is not the same as a profile
+                # that failed to match.
+                continue
+
+            # THE ISOLATION BOUNDARY. Filtered before anything is
+            # compared, so the matcher is never handed a mixed list.
+            owned = _released_for_matching(parties.owned_by(
+                documents, party.party_id,
+                is_primary=party.party_role is parties.PartyRole.PRIMARY_APPLICANT,
+            ))
+
+            matches.append(profile_match.match_party(
+                party_id=party.party_id,
+                party_role=party.party_role.value,
+                profile=profile,
+                documents=owned,
+            ).public())
+        except Exception:  # pragma: no cover - evidence must not break a read
+            logger.exception(
+                "Profile matching failed for party %s", party.party_id)
+
+    return matches
+
+
+# ==========================================================================
+# KYC, ONE PARTY AT A TIME
+# ==========================================================================
+
+
+def _kyc_for_party(
+    documents: list[dict[str, Any]], *, party_id: str, request_id: str,
+) -> dict[str, Any]:
+    """
+    Cross-document KYC over ONE party's documents.
+
+    THE ALGORITHM IS UNCHANGED. This builds the same sources from the
+    same released fields and calls the same `run_kyc`; the only
+    difference from before is that `documents` holds one person's
+    uploads instead of the whole case's. Name matching, date and PAN
+    normalisation, address comparison, the confidence model, the field
+    weights, the thresholds and the reason codes are all whatever KYC
+    already does.
+
+    THE GATE IS OBEYED, AND IT WAS NOT BEFORE. `to_kyc_source` checks
+    only that `extraction.fields` is populated -- and the internal
+    envelope carries extraction whatever the verdict, because the gate
+    is applied at the response boundary on the way out. So a REVIEW, a
+    FAIL, a REJECTED and a run with extraction switched off ALL fed
+    cross-document KYC with fields the caller was never shown, and the
+    comment here claimed the opposite. Closed by running the documents
+    through `_released_for_matching` -- the same gate Phase 4 profile
+    matching uses, which is the same `response.released_extraction` the
+    response boundary uses. One gate, three consumers.
+    """
+    sources = []
+    for result in _released_for_matching(documents):
+        source = to_kyc_source(result, result.get("source_id", "unknown"))
+        if source is not None:
+            sources.append(source)
+
+    if not sources:
+        # NOTHING TO CHECK, which is not the same as checked and found
+        # wanting. `ran` says which: KYC itself also reports
+        # INSUFFICIENT_SOURCES when it runs over a single document and
+        # has nothing to compare it WITH, and the two must not be
+        # confused -- one is a real REVIEW verdict about this party, the
+        # other is the absence of a verdict. Internal; the public shape
+        # is an allowlist that drops it.
+        return {
+            "party_id": party_id,
+            "ran": False,
+            "status": CheckStatus.SKIPPED.value,
+            "reason_codes": ["INSUFFICIENT_SOURCES"],
+        }
+
+    kyc_result = run_kyc(
+        KycRequest(applicant_id=party_id, documents=sources),
+        request_id=request_id,
+    )
+
+    return {
+        # WHOSE VERDICT THIS IS. Internal only -- the public KYC object is
+        # built from an explicit allowlist in `_public_envelope`, so this
+        # never reaches a caller except as the `party_id` deliberately
+        # added to case-level rows on a two-party case.
+        "party_id": party_id,
+        "ran": True,
+        "status": kyc_result.status.value,
+        "reason_codes": [code.value for code in kyc_result.reason_codes],
+        # The FIELD-LEVEL view: one row per comparable field, with how
+        # closely the values matched and how far that answer can be
+        # relied on. Derived from the same checks below, never computed
+        # a second time.
+        "overall_score": kyc_result.overall_score,
+        "overall_confidence": kyc_result.overall_confidence,
+        "fields": [
+            field.model_dump(mode="json") for field in kyc_result.fields
+        ],
+        # Per-check results, so a disagreement between documents can be
+        # reported as a conflict rather than only as a status. The full
+        # pair-comparison matrix stays internal.
+        "checks": [
+            {
+                "check": check.check.value,
+                "status": check.status.value,
+                "reason_codes": [code.value for code in check.reason_codes],
+                "source_ids": _disagreeing_sources(check),
+                # What each document actually said. Without it a reviewer
+                # is told two documents disagree and has to open both to
+                # find out how.
+                "values": _reported_values(check),
+                # Whether this check failing may drive the verdict down
+                # to FAIL, or is capped at REVIEW. Read from policy, not
+                # decided here.
+                "blocking": check_is_blocking(check.check.value),
+            }
+            for check in kyc_result.checks
+        ],
+    }
+
+
+def _did_not_run(payload: dict[str, Any] | None) -> bool:
+    """
+    This party released nothing, as opposed to reaching a verdict.
+
+    Keyed on an explicit flag, NOT on the reason codes: KYC reports
+    INSUFFICIENT_SOURCES itself when it runs over a lone document and
+    has nothing to compare it with, and reading that as "did not run"
+    silently dropped a real REVIEW verdict out of the case roll-up.
+    """
+    return bool(payload) and not payload.get("ran", True)
+
+
+def _case_kyc(
+    per_party: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int]:
+    """
+    One case-level KYC verdict from the parties' own verdicts.
+
+    NOT A CROSS-PARTY COMPARISON, AND IT MUST NEVER BECOME ONE. Nothing
+    here compares a field from one party against a field from another.
+    It rolls up verdicts that were each reached WITHIN one person's
+    documents.
+
+    A single-applicant case returns that party's result untouched, so
+    the existing contract is byte-for-byte what it was.
+
+    Worst-wins, matching the status semantics already used everywhere
+    else in this response: a co-applicant whose documents disagree with
+    each other still routes the case to a human. Score and confidence
+    take the MINIMUM rather than an average, because averaging lets a
+    well-documented applicant hide a poorly-documented co-applicant.
+
+    A party whose KYC could not run contributes nothing -- neither a
+    verdict nor a zero -- which is how "the co-applicant has not sent
+    anything yet" avoids reading as "the co-applicant failed".
+    """
+    ran = [payload for payload in per_party if not _did_not_run(payload)]
+
+    if not ran:
+        # Nobody had anything comparable. Exactly the shape, and the
+        # rank, a single-applicant case produced before.
+        #
+        # `ran` MUST be carried here. Without it `_did_not_run` read the
+        # default and reported that KYC had run, so a VERIFY -- which
+        # releases nothing by design -- stopped reporting KYC_NOT_RUN
+        # and the caller was left to infer from a bare SKIPPED that the
+        # gate had held rather than being told.
+        return (
+            {"ran": False,
+             "status": CheckStatus.SKIPPED.value,
+             "reason_codes": ["INSUFFICIENT_SOURCES"]},
+            0,
+        )
+
+    if len(ran) == 1:
+        payload = ran[0]
+        return payload, _rank(payload.get("status"))
+
+    reason_codes: list[str] = []
+    for payload in ran:
+        reason_codes.extend(payload.get("reason_codes") or [])
+
+    aggregate = {
+        "status": _worst_kyc_status(ran),
+        "reason_codes": list(dict.fromkeys(reason_codes)),
+        "overall_score": min(
+            int(p.get("overall_score") or 0) for p in ran),
+        "overall_confidence": min(
+            int(p.get("overall_confidence") or 0) for p in ran),
+        # WHOSE ROW IS WHOSE. Two parties produce two NAME rows, and a
+        # reviewer reading a case-level list has to be able to tell them
+        # apart. `party_id` is added only when the case actually has
+        # more than one party, so a single-applicant response carries
+        # exactly the keys it carried before.
+        "fields": [
+            {**field, "party_id": payload.get("party_id", "")}
+            for payload in ran
+            for field in (payload.get("fields") or [])
+        ],
+        "checks": [
+            {**check, "party_id": payload.get("party_id", "")}
+            for payload in ran
+            for check in (payload.get("checks") or [])
+        ],
+    }
+
+    return aggregate, _rank(aggregate["status"])
+
+
+def _worst_kyc_status(payloads: list[dict[str, Any]]) -> str:
+    """The most severe verdict any party reached, on the existing scale."""
+    worst = max(payloads, key=lambda p: _rank(p.get("status")))
+    return str(worst.get("status") or CheckStatus.SKIPPED.value)
+
+
+def _status_for(
+    documents: list[dict[str, Any]], kyc_rank: int,
+) -> tuple[str, bool]:
+    """
+    The worst-wins roll-up over a set of documents and a KYC rank.
+
+    Returns the status and whether NOTHING was verified, because the
+    caller that owns the whole case also owes the client an error about
+    that and a party section does not.
+
+    EXTRACTED, NOT CHANGED. This was inline in `process_application` and
+    computed the case verdict; it now also computes each party's, over
+    that party's own documents and their own KYC. Same severity scale,
+    same rules, same words -- one set of documents in, one status out.
+
+    A DOCUMENT TYPE MISMATCH IS A WRONG UPLOAD, NOT A CREDIT REJECTION.
+    The document itself fails -- verification FAIL, no extraction -- but
+    the application is not rejected for it: the applicant sent the wrong
+    file and can send the right one. Capped at REVIEW in the same way a
+    non-blocking KYC disagreement is, so the case reaches a human with
+    REQUEST_CORRECT_DOCUMENT rather than being turned down.
+    """
+    def _document_rank(result: dict[str, Any]) -> int:
+        rank = _rank(result.get("status"))
+        if _is_type_mismatch(result):
+            return min(rank, _rank("REVIEW"))
+        return rank
+
+    # NOBODY SENT ANYTHING IS NOT A SUCCESS.
+    #
+    # A declared co-applicant who has not uploaded yet has no documents
+    # and no KYC, and both of those rank as harmless -- so the roll-up
+    # read SUCCESS for a party about whom NOTHING IS KNOWN. That is the
+    # most misleading thing a per-party status could say, and it is the
+    # reason this guard is explicit rather than left to the arithmetic.
+    #
+    # Unreachable at case level: the endpoint requires at least one file.
+    if not documents:
+        return "REVIEW", False
+
+    worst = max(
+        [_document_rank(result) for result in documents] + [kyc_rank],
+        default=1,
+    )
+
+    # NOTHING VERIFIED IS NOT A SUCCESS EITHER.
+    #
+    # SKIPPED ranks alongside SUCCESS, which is right for one skipped
+    # stage inside a healthy application and wrong where every document
+    # was skipped: with verification switched off the documents all
+    # report SKIPPED, KYC has no sources and also reports SKIPPED, and
+    # the roll-up read SUCCESS for a case in which nothing was checked.
+    #
+    # A FLOOR, not an override -- something that actually failed still
+    # reports FAILED rather than being softened to REVIEW.
+    nothing_verified = not response.any_document_verified(documents)
+
+    if nothing_verified:
+        worst = max(worst, _rank("REVIEW"))
+
+    status = _public_status(worst)
+
+    # PARTIAL and REVIEW share a severity, and the roll-up renders that
+    # severity as PARTIAL -- the right word where some of it worked.
+    # Where nothing was verified, none of it did, so the word is REVIEW.
+    # Only this case is renamed; every other PARTIAL keeps its name.
+    if nothing_verified and status == "PARTIAL":
+        status = "REVIEW"
+
+    return status, nothing_verified
+
+
+def _kyc_rank_of(payload: dict[str, Any] | None) -> int:
+    """One party's KYC contribution to their roll-up."""
+    if not payload or _did_not_run(payload):
+        return 0
+    return _rank(payload.get("status"))
+
+
+def _public_cross_document(
+    envelope: dict[str, Any], kyc: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Agreement between documents, at CASE level.
+
+    ON A TWO-PARTY CASE THERE IS NOTHING AT CASE LEVEL TO REPORT. KYC is
+    scoped per party, so every check ran WITHIN one person's documents
+    and is already published under that person. Surfacing them again
+    here read as case-level cross-document findings, which is how a
+    reviewer came to see NAME_MISMATCH against a joint application whose
+    two people simply have different names.
+
+    SKIPPED, NOT PASS. Nothing was compared across the parties, and PASS
+    would claim agreement was established. The distinction is the whole
+    reason this is an object and not a list of disagreements -- "every
+    field agreed" and "nothing was comparable" both arrive with no
+    checks and mean opposite things.
+
+    A single-applicant case is unchanged: its checks ARE case-level, and
+    they are reported exactly as before.
+    """
+    if not los_config.conflict_detection_enabled():
+        return {"status": "SKIPPED", "checks": []}
+
+    if envelope.get("co_applicant_id"):
+        return {"status": "SKIPPED", "checks": []}
+
+    return response.cross_document_from(kyc)
+
+
+def _party_sections(
+    envelope: dict[str, Any], documents: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    `primary_applicant`, and `co_applicant` where there is one.
+
+    PURELY A REGROUPING. `documents` are the compact dicts already
+    published in the top-level `documents[]` and the profile matches are
+    the ones Phase 4 computed. Nothing is re-verified, re-extracted or
+    re-matched -- this call costs a dictionary lookup per document.
+
+    ADDITIVE, SO EXISTING CALLERS ARE UNAFFECTED. Everything a caller
+    reads today stays exactly where it was and says exactly what it said;
+    these are new keys beside it. `co_applicant` is absent -- not null,
+    not empty -- when the case has only one party, because a null there
+    would read as "there is a second party and we do not know who".
+
+    The primary applicant's section is always present, including on a
+    single-applicant request, so a client has one shape to render rather
+    than two code paths.
+    """
+    matches = {
+        str(entry.get("party_id")): entry
+        for entry in (envelope.get("profile_match") or [])
+    }
+    # Each party's OWN cross-document KYC, computed per party in the
+    # flow. Never a cross-party comparison -- see `_case_kyc`.
+    kyc_by_party = envelope.get("party_kyc") or {}
+
+    # ON A SINGLE-APPLICANT CASE THE TOP-LEVEL `kyc` IS THIS PARTY'S.
+    #
+    # Publishing it again inside the section produced a byte-identical
+    # copy carrying no information -- and it pushed a two-document
+    # response past the size guard, which is what caught it. A party's
+    # own `kyc` appears only where there is a second party to tell it
+    # apart from.
+    scoped_kyc = bool(envelope.get("co_applicant_id"))
+    status_by_party = envelope.get("party_status") or {}
+
+    applicant_id = str(envelope.get("applicant_id") or "")
+    co_applicant_id = str(envelope.get("co_applicant_id") or "")
+
+    if not applicant_id:
+        return {}
+
+    sections: dict[str, Any] = {
+        "primary_applicant": response.party_section(
+            party_id=applicant_id,
+            party_role="PRIMARY_APPLICANT",
+            # Only the primary adopts an unstamped document -- see
+            # `documents_of`. A pre-party stored row has no party_id and
+            # always belonged to the case's applicant.
+            documents=parties.owned_by(
+                documents, applicant_id, is_primary=True),
+            profile_match=matches.get(applicant_id),
+            kyc=kyc_by_party.get(applicant_id) if scoped_kyc else None,
+            status=status_by_party.get(applicant_id),
+        )
+    }
+
+    if co_applicant_id:
+        sections["co_applicant"] = response.party_section(
+            party_id=co_applicant_id,
+            party_role="CO_APPLICANT",
+            documents=parties.owned_by(
+                documents, co_applicant_id, is_primary=False),
+            profile_match=matches.get(co_applicant_id),
+            kyc=kyc_by_party.get(co_applicant_id),
+            status=status_by_party.get(co_applicant_id),
+        )
+
+    return sections
+
+
+def _released_for_matching(
+    documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Each document reduced to the fields the verification gate RELEASED.
+
+    THE DEFECT THIS CLOSES. Profile matching runs on the internal
+    envelope, which carries `extraction` on every document regardless of
+    verdict -- the gate is applied at the response boundary, on the way
+    out. Handing the matcher the internal list therefore compared a
+    declared PAN against fields a REVIEW had withheld from the caller,
+    and reported PASS at score 100 on evidence nobody was allowed to see.
+    The same hole let a deployment with extraction switched off keep
+    matching on the fields it had just been told not to release.
+
+    ONE GATE, NOT TWO. `released_extraction` is the same function the
+    response boundary calls. Re-deciding "was this releasable" here is
+    how the two answers drift, which is exactly how the gate was lost
+    once before in the compact response shape.
+    """
+    from app.agents.los.response import released_extraction, verification_status
+
+    released: list[dict[str, Any]] = []
+
+    for document in documents:
+        allowed = released_extraction(
+            document.get("extraction"), verification_status(document))
+        if not allowed or not allowed.get("fields"):
+            continue
+        # Field quality travels with the fields it describes; it feeds the
+        # confidence figure and is never published.
+        released.append({
+            **document,
+            "extraction": {
+                "fields": allowed["fields"],
+                "field_quality": (document.get("extraction") or {}).get(
+                    "field_quality") or {},
+            },
+        })
+
+    return released
+
+
+def _stored_profile_for(party_id: str):
+    """
+    The persisted profile for one party, where the store has one.
+
+    Request values win over these -- see `profile_match.merged`. Reading
+    the store is best-effort: an unavailable case store must not turn a
+    successful extraction into a failure.
+    """
+    from app.agents.los import profile_match
+
+    try:
+        from app.store import get_repository
+
+        return profile_match.stored_profile(
+            get_repository().get_applicant(party_id))
+    except Exception:
+        return profile_match.Profile()
+
+
 async def process_application(
     uploads: Iterable[UploadedDocument],
     *,
@@ -585,6 +1141,19 @@ async def process_application(
     applicant_id: str | None = None,
     case_id: str | None = None,
     request_id: str,
+    # -- the optional second party on this case -------------------------
+    #
+    # Both default to absent, so a single-applicant call behaves exactly
+    # as it did before co-applicants existed.
+    co_applicant_id: str | None = None,
+    co_applicant_uploads: Iterable[UploadedDocument] | None = None,
+    # -- declared profiles, matched against each party's OWN documents ---
+    #
+    # Both optional. A call that supplies neither produces no profile
+    # match at all, which is what every existing caller gets.
+    applicant_profile: dict[str, Any] | None = None,
+    co_applicant_profile: dict[str, Any] | None = None,
+    profile_matching: bool = True,
     use_llm_summary: bool | None = None,
     cross_document_checks: bool = True,
     summarise: bool = True,
@@ -630,12 +1199,59 @@ async def process_application(
     # id, and nothing from another case can reach this one.
     case_id = (case_id or "").strip() or f"case_{uuid.uuid4().hex}"
 
+    # ---------------------------------------------------------------
+    # WHO IS ON THIS CASE.
+    #
+    # Resolved once, before anything is processed, so every document is
+    # stamped with its owner at the point it enters the pipeline rather
+    # than being attributed afterwards from whichever list it came out of.
+    # Attribution after the fact is how a co-applicant's PAN ends up on
+    # the primary applicant's file.
+    # ---------------------------------------------------------------
+    primary, co_applicant = parties.resolve(
+        case_id=case_id,
+        applicant_id=applicant_id,
+        co_applicant_id=co_applicant_id,
+    )
+    applicant_id = primary.party_id
+
+    co_uploads = list(co_applicant_uploads or [])
+    if co_uploads and co_applicant is None:
+        raise ValueError(
+            "co_applicant_files were supplied without a co_applicant_id. "
+            "A document with no owner cannot be filed against a case."
+        )
+
+    for upload in uploads:
+        upload.party = primary
+    for upload in co_uploads:
+        upload.party = co_applicant
+
+    # ONE PIPELINE, TWO PARTIES. Both sets go through exactly the same
+    # `_process_one`; only the party stamped on each upload differs. A
+    # second code path for the co-applicant is a second place for the
+    # verification gate to be got wrong.
+    every_upload = list(uploads) + co_uploads
+
     # Independent work, run together.
     documents = await asyncio.gather(
         *(_process_one(upload, operation, request_id,
                        financial_analysis=financial_analysis)
-          for upload in uploads)
+          for upload in every_upload)
     )
+
+    # OWNERSHIP IS STAMPED FROM THE UPLOAD, NOT INFERRED FROM THE RESULT.
+    #
+    # `_process_one` has several exits -- specialist, identity, financial,
+    # disabled, failed -- and requiring each of them to remember the party
+    # would mean one of them eventually forgetting. Zipped against the
+    # uploads in the order they were submitted, which `asyncio.gather`
+    # preserves, so a document cannot be attributed to the wrong person by
+    # a route that did not think about it.
+    for upload, result in zip(every_upload, documents):
+        if upload.party is not None:
+            result["party_id"] = upload.party.party_id
+            result["party_role"] = upload.party.party_role.value
 
     # ---------------------------------------------------------------
     # KYC. Consumes only what the agents already released: a document
@@ -643,14 +1259,35 @@ async def process_application(
     # nothing, which is the gate doing its job.
     # ---------------------------------------------------------------
     kyc_started = time.perf_counter()
-
-    sources = []
-    for result in documents:
-        source = to_kyc_source(result, result.get("source_id", "unknown"))
-        if source is not None:
-            sources.append(source)
-
     errors: list[dict[str, Any]] = []
+
+    # PARTY-SCOPED, BECAUSE OF WHAT KYC ASKS.
+    #
+    # KYC asks whether several documents describe ONE person, so it may
+    # only ever compare documents belonging to the same person. Run over
+    # a whole two-party case it compared the primary applicant's PAN
+    # against the co-applicant's and reported NAME_MISMATCH,
+    # DOB_MISMATCH, PAN_MISMATCH and FATHER_NAME_MISMATCH -- two
+    # different people correctly disagreeing, read as a KYC failure, and
+    # a clean joint application routed to a human for it.
+    #
+    # NOTHING ABOUT THE COMPARISON CHANGES. Same matchers, same
+    # thresholds, same weights, same confidence model, same reason
+    # codes. Only the SCOPE of the input changes, which is why a
+    # single-applicant case runs exactly the call it ran before: the
+    # primary's document set is the whole case's.
+    kyc_parties = [
+        # Only the primary adopts an unstamped document -- a row written
+        # before parties existed always belonged to the case's applicant.
+        (primary, parties.owned_by(
+            documents, primary.party_id, is_primary=True)),
+    ]
+    if co_applicant is not None:
+        kyc_parties.append(
+            (co_applicant, parties.owned_by(
+                documents, co_applicant.party_id, is_primary=False)))
+
+    party_kyc: dict[str, dict[str, Any]] = {}
 
     if not cross_document_checks:
         # The caller's stage does not own KYC. Nothing is computed and
@@ -666,61 +1303,37 @@ async def process_application(
             "checks": [],
         }
         kyc_rank = _rank(CheckStatus.SKIPPED.value)
-    elif sources:
-        kyc_result = run_kyc(
-            KycRequest(applicant_id=applicant_id, documents=sources),
-            request_id=request_id,
-        )
-        kyc_payload = {
-            "status": kyc_result.status.value,
-            "reason_codes": [code.value for code in kyc_result.reason_codes],
-            # The FIELD-LEVEL view: one row per comparable field, with how
-            # closely the values matched and how far that answer can be
-            # relied on. Derived from the same checks below, never computed
-            # a second time.
-            "overall_score": kyc_result.overall_score,
-            "overall_confidence": kyc_result.overall_confidence,
-            "fields": [
-                field.model_dump(mode="json") for field in kyc_result.fields
-            ],
-            # Per-check results, so a disagreement between documents can be
-            # reported as a conflict rather than only as a status. The full
-            # pair-comparison matrix stays internal.
-            "checks": [
-                {
-                    "check": check.check.value,
-                    "status": check.status.value,
-                    "reason_codes": [code.value for code in check.reason_codes],
-                    "source_ids": _disagreeing_sources(check),
-                    # What each document actually said. Without it a reviewer
-                    # is told two documents disagree and has to open both to
-                    # find out how.
-                    "values": _reported_values(check),
-                    # Whether this check failing may drive the verdict down
-                    # to FAIL, or is capped at REVIEW. Read from policy, not
-                    # decided here.
-                    "blocking": check_is_blocking(check.check.value),
-                }
-                for check in kyc_result.checks
-            ],
-        }
-        kyc_rank = _rank(kyc_result.status.value)
     else:
-        kyc_payload = {
-            "status": CheckStatus.SKIPPED.value,
-            "reason_codes": ["INSUFFICIENT_SOURCES"],
-        }
-        kyc_rank = 0
-        errors.append({
-            "code": "KYC_NOT_RUN",
-            "message": (
-                "No document released extracted fields, so there was nothing "
-                "to cross-check. VERIFY never releases fields, and EXTRACT "
-                "releases them only after verification passes."
-            ),
-        })
+        for party, owned in kyc_parties:
+            party_kyc[party.party_id] = _kyc_for_party(
+                owned, party_id=party.party_id, request_id=request_id)
+
+        kyc_payload, kyc_rank = _case_kyc(
+            [party_kyc[party.party_id] for party, _ in kyc_parties])
+
+        if _did_not_run(kyc_payload):
+            errors.append({
+                "code": "KYC_NOT_RUN",
+                "message": (
+                    "No document released extracted fields, so there was "
+                    "nothing to cross-check. VERIFY never releases fields, "
+                    "and EXTRACT releases them only after verification "
+                    "passes."
+                ),
+            })
 
     kyc_ms = (time.perf_counter() - kyc_started) * 1000
+
+    # EACH PARTY'S OWN DOCUMENT/KYC STATE.
+    #
+    # The same roll-up the case uses, over that party's own documents
+    # and their own KYC. Nothing is re-verified and no KYC is re-run --
+    # both results are already in hand; this is arithmetic over them.
+    party_status = {
+        party.party_id: _status_for(
+            owned, _kyc_rank_of(party_kyc.get(party.party_id)))[0]
+        for party, owned in kyc_parties
+    }
 
     # ---------------------------------------------------------------
     # Overall verdict: the worst of every document and the KYC result.
@@ -732,31 +1345,9 @@ async def process_application(
     # file and can send the right one. Capped at REVIEW for the roll-up in
     # the same way a non-blocking KYC disagreement is, so the case reaches a
     # human with REQUEST_CORRECT_DOCUMENT rather than being turned down.
-    def _document_rank(result: dict[str, Any]) -> int:
-        rank = _rank(result.get("status"))
-        if _is_type_mismatch(result):
-            return min(rank, _rank("REVIEW"))
-        return rank
-
-    worst = max(
-        [_document_rank(result) for result in documents] + [kyc_rank],
-        default=1,
-    )
-
-    # NOTHING VERIFIED IS NOT A SUCCESS.
-    #
-    # SKIPPED ranks alongside SUCCESS, which is right for one skipped stage
-    # inside a healthy application and wrong for an application where every
-    # document was skipped: with verification switched off the documents all
-    # report SKIPPED, KYC has no sources and also reports SKIPPED, and the
-    # roll-up read SUCCESS for a case in which nothing had been checked.
-    #
-    # A FLOOR, not an override -- an application that actually failed still
-    # reports FAILED rather than being softened to REVIEW.
-    nothing_verified = documents and not response.any_document_verified(documents)
+    status, nothing_verified = _status_for(documents, kyc_rank)
 
     if nothing_verified:
-        worst = max(worst, _rank("REVIEW"))
         errors.append({
             "code": response.NO_VERIFIED_DOCUMENTS,
             "message": (
@@ -766,20 +1357,37 @@ async def process_application(
             ),
         })
 
-    status = _public_status(worst)
-
-    # PARTIAL and REVIEW share a severity, and the roll-up renders that
-    # severity as PARTIAL -- the right word for an application where some of
-    # it worked. Where nothing was verified, none of it did, so the word is
-    # REVIEW. Only this case is renamed; every other PARTIAL keeps its name.
-    if nothing_verified and status == "PARTIAL":
-        status = "REVIEW"
-
     for result in documents:
         for error in result.get("errors") or []:
             errors.append({**error, "source_id": result.get("source_id")})
 
+    # ---------------------------------------------------------------
+    # PROFILE MATCHING, per party, over that party's OWN documents.
+    #
+    # An ADDITIONAL evidence layer. It runs after every verdict is final
+    # and cannot reach back into one: nothing below writes to a
+    # document's status, reason codes or score. A profile mismatch is
+    # reported as profile evidence, and the document remains whatever
+    # verification found it to be.
+    #
+    # Deterministic and free of I/O: it reads fields the gate already
+    # released. No OCR, no model call, no second pass over any document.
+    # ---------------------------------------------------------------
+    profile_started = time.perf_counter()
+    profile_matches: list[dict[str, Any]] = []
+
+    if profile_matching:
+        profile_matches = _match_profiles(
+            documents=documents,
+            primary=primary,
+            co_applicant=co_applicant,
+            applicant_profile=applicant_profile,
+            co_applicant_profile=co_applicant_profile,
+        )
+    profile_ms = round((time.perf_counter() - profile_started) * 1000, 2)
+
     processing = _aggregate_timings(documents)
+    processing["profile_match_ms"] = profile_ms
     processing["kyc_ms"] = round(kyc_ms, 2)
     processing["total_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
@@ -787,8 +1395,22 @@ async def process_application(
         "request_id": request_id,
         "applicant_id": applicant_id,
         "case_id": case_id,
+        # Present only when the case actually has a second party. A null
+        # `co_applicant_id` on every single-applicant response would read
+        # as "there is one and we do not know it".
+        **({"co_applicant_id": co_applicant.party_id}
+           if co_applicant is not None else {}),
         "status": status,
         "documents": documents,
+        # Absent when nothing was matched, so a caller that supplied no
+        # profile sees no empty section suggesting one was attempted.
+        **({"profile_match": profile_matches} if profile_matches else {}),
+        # Per-party KYC, so each section can publish its own. Internal:
+        # the public shape is built by `_party_sections` through the same
+        # allowlist the case-level object uses.
+        **({"party_kyc": party_kyc} if party_kyc else {}),
+        # Each party's own roll-up, published on their section.
+        **({"party_status": party_status} if party_status else {}),
         "summary": "",
         "processing": processing,
         "errors": errors,
@@ -886,7 +1508,17 @@ def _public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
 
     public: dict[str, Any] = {
         "request_id": envelope.get("request_id"),
+        # Profile evidence, per party. Absent when no profile was
+        # supplied for anyone -- an empty list would suggest matching
+        # was attempted and found nothing.
+        **({"profile_match": envelope["profile_match"]}
+           if envelope.get("profile_match") else {}),
         "applicant_id": envelope.get("applicant_id"),
+        # Present only when the case actually has a second party, so a
+        # null on every single-applicant response cannot be read as
+        # "there is a co-applicant and we do not know who".
+        **({"co_applicant_id": envelope["co_applicant_id"]}
+           if envelope.get("co_applicant_id") else {}),
         "case_id": envelope.get("case_id"),
         "status": envelope.get("status"),
         "documents": documents,
@@ -897,11 +1529,7 @@ def _public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
         # `conflicts` is still computed above -- decision and next_action are
         # derived from it -- it is simply no longer a separate public key
         # saying the same thing a second time.
-        "cross_document": (
-            response.cross_document_from(kyc)
-            if los_config.conflict_detection_enabled()
-            else {"status": "SKIPPED", "checks": []}
-        ),
+        "cross_document": _public_cross_document(envelope, kyc),
         # A word, not an object. The reasons behind it are already carried by
         # kyc.reason_codes and the cross-document checks, and repeating them
         # here made the same codes appear three times in one response.
@@ -915,6 +1543,8 @@ def _public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
         "errors": envelope.get("errors") or [],
     }
 
+    public.update(_party_sections(envelope, documents))
+
     # KYC, ONLY WHERE A STAGE ACTUALLY RAN IT.
     #
     # /api/v1/los/process runs it and this key is always present there, so
@@ -922,13 +1552,17 @@ def _public_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
     # checks off -- the FOS stage does -- gets no key at all, because it has
     # no KYC verdict to report and an object reading SKIPPED would be one.
     if ran_kyc:
-        public["kyc"] = {
-            "status": kyc.get("status", "SKIPPED"),
-            "reason_codes": list(kyc.get("reason_codes") or []),
-            "overall_score": kyc.get("overall_score", 0),
-            "overall_confidence": kyc.get("overall_confidence", 0),
-            "fields": response.public_kyc_fields(kyc),
-        }
+        # The same shaper the party sections use, so the case-level
+        # object and a party's own can never describe one result
+        # differently.
+        # COMPACT ON A TWO-PARTY CASE. Every field row is already
+        # published under the party it belongs to; a second full copy
+        # here said the same thing again and could not say whose row
+        # was whose. On a single-applicant case the top-level object is
+        # that party's only KYC, so it keeps its rows and the existing
+        # contract is untouched.
+        public["kyc"] = response.public_kyc(
+            kyc, compact=bool(envelope.get("co_applicant_id")))
 
     # NO STAGE-TIMING OBJECT.
     #

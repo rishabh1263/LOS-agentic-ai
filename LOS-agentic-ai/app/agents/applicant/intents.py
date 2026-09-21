@@ -39,6 +39,14 @@ class Intent(str, Enum):
     DOCUMENTS_REQUIRED = "DOCUMENTS_REQUIRED"
     DOCUMENTS_MISSING = "DOCUMENTS_MISSING"
     DOCUMENTS_PENDING = "DOCUMENTS_PENDING"
+    # WHY the checklist is what it is -- which rules fired, which could not
+    # be evaluated, and what made a conditional requirement apply.
+    #
+    # Distinct from DOCUMENTS_REQUIRED, which answers WHAT is needed. An
+    # officer who has to tell a customer why they are being asked for an
+    # extra document needs the rule, not the list, and the checklist
+    # answer cannot carry the whole explanation without becoming unreadable.
+    POLICY_EXPLANATION = "POLICY_EXPLANATION"
     DOCUMENT_VERIFICATION = "DOCUMENT_VERIFICATION"
 
     # -- workflow
@@ -95,6 +103,7 @@ SIMPLE_INTENTS = frozenset({
     Intent.DOCUMENTS_PENDING,
     Intent.PENDING_ITEMS,
     Intent.APPLICATION_STAGE,
+    Intent.POLICY_EXPLANATION,
 })
 
 #: Intents that change stored data. Every one needs a write scope and an
@@ -331,6 +340,51 @@ _PATTERNS: list[tuple[str, Intent]] = [
      Intent.DOCUMENTS_MISSING),
     (r"\b(missing|outstanding)\s+documents?\b", Intent.DOCUMENTS_MISSING),
     (r"\bwhich\s+docs?\s+are\s+(left|missing|pending)\b", Intent.DOCUMENTS_MISSING),
+    # THE QUESTION WITHOUT THE WORD "DOCUMENT" IN IT.
+    #
+    # "Show me what I still have to collect" is the plainest way a field
+    # officer asks this and it matched nothing -- it fell through to
+    # UNKNOWN, and from there to the knowledge base, which answered it
+    # confidently out of the FOS handbook with a paragraph about
+    # verification states. A confident irrelevant answer is worse than no
+    # answer: the officer reads it, learns nothing, and stops trusting the
+    # copilot.
+    #
+    # The verb carries the meaning here, not the noun. "Collect", "gather"
+    # and "get" with a still/left/remaining marker are asking what is
+    # outstanding whether or not the word "document" appears.
+    (r"\b(still|left|yet|remaining)\b.{0,24}\b(collect|gather|obtain|get)\b",
+     Intent.DOCUMENTS_MISSING),
+    (r"\b(collect|gather|obtain)\b.{0,16}\b(still|left|yet|remaining)\b",
+     Intent.DOCUMENTS_MISSING),
+    (r"\bwhat\s+(else\s+)?(do|does|should)\s+(i|we|the\s+customer|"
+     r"the\s+applicant)\s+need\s+to\s+(collect|bring|submit|upload|provide)\b",
+     Intent.DOCUMENTS_MISSING),
+    (r"\bwhat\s+(else\s+)?is\s+(still\s+)?(needed|required|outstanding)\b",
+     Intent.DOCUMENTS_MISSING),
+    (r"\bwhat\s+(else\s+)?(do|should)\s+i\s+(need|have)\s+to\s+ask\s+"
+     r"(for|the\s+customer)\b", Intent.DOCUMENTS_MISSING),
+    # WHY, before WHAT. These resemble the checklist patterns below and
+    # would be swallowed by them; a question asking for the reason must not
+    # be answered with the list.
+    (r"\bwhy\s+(does|do)\s+(the\s+)?(checklist|list|requirements?)\b",
+     Intent.POLICY_EXPLANATION),
+    (r"\bwhy\s+(is|are)\s+(the\s+)?(checklist|list)\b.{0,24}"
+     r"\b(provisional|not\s+final|incomplete|changing)\b",
+     Intent.POLICY_EXPLANATION),
+    (r"\bwhy\s+(is|are|do|does)\b.{0,40}\b(required|needed|asked\s+for|"
+     r"mandatory)\b.{0,30}\b(for\s+this|on\s+this|here)\b",
+     Intent.POLICY_EXPLANATION),
+    (r"\b(which|what)\s+(policy|rule|rules)\b.{0,30}"
+     r"\b(applied|apply|applies|used)\b", Intent.POLICY_EXPLANATION),
+    (r"\b(explain|show\s+me)\s+(the\s+)?(policy|rules?)\b.{0,24}"
+     r"\b(checklist|documents?|case|application)\b",
+     Intent.POLICY_EXPLANATION),
+    (r"\bwhat\s+(policy|rule|version)\b.{0,24}\b(is|was)\s+(this|it)\b",
+     Intent.POLICY_EXPLANATION),
+    (r"\bwhat\s+else\s+(do\s+you|does\s+the\s+system)\s+need\s+to\s+know\b",
+     Intent.POLICY_EXPLANATION),
+
     # The checklist patterns come FIRST. "Show me the document checklist" also
     # matches the generic show/list-documents pattern below, and whichever is
     # listed first wins -- so the more specific question has to be.
@@ -484,6 +538,7 @@ PLANS: dict[Intent, tuple[str, ...]] = {
     Intent.APPLICATION_STAGE: ("applicant.360",),
     Intent.DOCUMENTS_UPLOADED: ("documents.get",),
     Intent.DOCUMENTS_REQUIRED: ("documents.checklist",),
+    Intent.POLICY_EXPLANATION: ("documents.checklist",),
     Intent.DOCUMENTS_MISSING: ("documents.checklist",),
     Intent.DOCUMENTS_PENDING: ("documents.get", "workflow.pending_items"),
     Intent.DOCUMENT_VERIFICATION: ("documents.verification",),

@@ -692,7 +692,15 @@ def test_extracted_values_are_not_copied_into_the_store(_store):
                        "extraction": {"pan_number": "ABCDE1234F"}}],
     })
 
-    document = _store.get_document("CASE-ING:pan.jpg")
+    # LOOKED UP BY CASE, NOT BY KEY. The stored key is
+    # `case:party:source` now that a case can carry two people, and a
+    # test that hardcodes the key shape is asserting an internal detail
+    # rather than the behaviour it is named for -- which is that field
+    # NAMES are stored and values are not.
+    documents = _store.list_documents("CASE-ING")
+    assert len(documents) == 1
+    document = documents[0]
+
     assert document.extracted_fields == {"pan_number": True}
     assert "ABCDE1234F" not in str(document.extracted_fields)
 

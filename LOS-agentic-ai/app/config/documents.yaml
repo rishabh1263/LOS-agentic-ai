@@ -116,6 +116,17 @@ verification:
         required_fields: [voter_id, name]
         checks:
           date_plausible: true
+        # The extractor calls the EPIC number `epic_number`; this file asks
+        # for `voter_id`. Both are right and they did not agree, so every
+        # voter ID reached REQUIRED_FIELD_MISSING -> REVIEW with the number
+        # sitting in the extraction, read at 0.95 confidence.
+        #
+        # The alias reconciles the two vocabularies. The contract test in
+        # tests/agents/test_required_field_contract.py is what stops it
+        # happening again: it fails if any configured required field is not
+        # producible by that type's extractor.
+        field_aliases:
+          voter_id: [epic_number]
 
       PASSPORT:
         required_fields: [passport_number, name, date_of_birth]

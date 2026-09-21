@@ -141,10 +141,71 @@ def _application_json(app) -> dict[str, Any]:
         "status": app.status.value,
         "product": app.product,
         "loan_amount": app.loan_amount,
+        "employment_type": app.employment_type,
         "missing_fields": app.missing_fields(),
         "created_at": app.created_at.isoformat(),
         "updated_at": app.updated_at.isoformat(),
     }
+
+
+def _pin_policy(record) -> bool:
+    """
+    Record the policy version this case is being assessed under.
+
+    ONCE. A pin that moved every time the file changed would record nothing
+    -- the point of it is that an applicant told on Monday to bring three
+    documents can be shown, later, which version of the rules said so.
+
+    Returns whether anything was pinned.
+    """
+    from app.agents.policy import engine as policy
+    from app.store.models import utcnow
+
+    if record.policy_version:
+        return False
+    try:
+        resolution = policy.resolve(
+            record.product,
+            loan_amount=record.loan_amount,
+            attributes=record.policy_attributes(),
+        )
+    except Exception:  # pragma: no cover - configuration failure
+        logger.exception("Could not resolve a policy to pin to %s",
+                         record.case_id)
+        return False
+
+    record.policy_id = resolution.policy_id
+    record.policy_version = resolution.policy_version
+    record.policy_pinned_at = utcnow()
+    return True
+
+
+def _policy_json(app, resolution) -> dict[str, Any]:
+    """
+    Which policy produced this checklist, and whether it is still the one
+    the case was opened under.
+
+    THE PIN IS A RECORD, NOT A REPLAY. A case stores the policy version it
+    was first assessed under so an audit can see it. This service resolves
+    against the CURRENT file -- it does not keep old policy files and cannot
+    re-run a superseded version. When the two differ that is stated in
+    `version_changed` rather than implied by a version number that would
+    otherwise read as the one in force.
+    """
+    block = dict(resolution.provenance())
+    block["pinned_version"] = app.policy_version
+    block["pinned_at"] = (app.policy_pinned_at.isoformat()
+                          if app.policy_pinned_at else None)
+    changed = bool(app.policy_version
+                   and app.policy_version != resolution.policy_version)
+    block["version_changed"] = changed
+    if changed:
+        block["note"] = (
+            f"This case was opened under policy {app.policy_version}. The "
+            f"checklist above was resolved under {resolution.policy_version}, "
+            f"which is the version now in force."
+        )
+    return block
 
 
 def _document_json(d) -> dict[str, Any]:
@@ -233,12 +294,14 @@ async def document_checklist(case_id: str) -> ToolEnvelope:
         if application is None:
             raise NotFound(f"No application for case {cid}.", case_id=cid)
         documents = repo.list_documents(cid)
-        entries = workflow.build_checklist(application, documents)
+        resolution = workflow.resolution_for(application)
+        entries = workflow.build_checklist(application, documents, resolution)
         return {
             "checklist": entries,
             "missing": [e["slot"] for e in entries if e["status"] == "MISSING"],
             "satisfied": [e["slot"] for e in entries if e["status"] == "VERIFIED"],
             "product": application.product,
+            "policy": _policy_json(application, resolution),
         }
 
     return await _envelope("documents.checklist", run)
@@ -354,13 +417,19 @@ async def applicant_360(case_id: str) -> ToolEnvelope:
         documents = repo.list_documents(cid)
 
         readiness_result = workflow.readiness(applicant, application, documents)
+        # ONE RESOLUTION, used for both the checklist and the block that
+        # explains it. Resolving twice would let the two disagree if a
+        # policy file were edited between the calls.
+        resolution = workflow.resolution_for(application)
         return {
             "applicant": _applicant_json(applicant) if applicant else None,
             "application": _application_json(application),
             "stage": workflow.derived_stage(application, documents, readiness_result),
             "documents": [_document_json(d) for d in documents],
             "document_summary": workflow.document_summary(documents),
-            "checklist": workflow.build_checklist(application, documents),
+            "checklist": workflow.build_checklist(application, documents,
+                                                  resolution),
+            "policy": _policy_json(application, resolution),
             "pending_items": workflow.pending_items(applicant, application, documents),
             "next_action": workflow.next_action(applicant, application, documents),
             "readiness": readiness_result,
@@ -447,6 +516,7 @@ async def application_create(
     product: str | None = None,
     loan_amount: str | None = None,
     case_id: str | None = None,
+    employment_type: str | None = None,
 ) -> ToolEnvelope:
     """Create an application for an existing applicant."""
 
@@ -468,7 +538,9 @@ async def application_create(
         record = Application(
             case_id=cid, applicant_id=aid,
             product=(product or None), loan_amount=(loan_amount or None),
+            employment_type=((employment_type or "").strip().upper() or None),
         )
+        _pin_policy(record)
         repo.save_application(record)
         return {"application": _application_json(record), "created": True}
 
@@ -479,6 +551,7 @@ async def application_update(
     case_id: str,
     product: str | None = None,
     loan_amount: str | None = None,
+    employment_type: str | None = None,
 ) -> ToolEnvelope:
     """Update basic application information."""
 
@@ -496,6 +569,14 @@ async def application_update(
         if loan_amount is not None and str(loan_amount).strip():
             record.loan_amount = str(loan_amount).strip()
             changed.append("loan_amount")
+        if employment_type is not None and str(employment_type).strip():
+            record.employment_type = str(employment_type).strip().upper()
+            changed.append("employment_type")
+
+        # A case opened before its product was chosen has nothing to pin to.
+        # Pin now, on the first update that gives it a product.
+        if _pin_policy(record):
+            changed.append("policy_version")
 
         if not changed:
             raise InvalidInput("No fields were supplied to update.")

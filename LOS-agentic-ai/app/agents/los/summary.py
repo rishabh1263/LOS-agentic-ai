@@ -162,6 +162,89 @@ def _kyc_sentence(kyc: dict[str, Any] | None) -> str:
     return f" KYC {status}."
 
 
+def _party_kyc_sentence(envelope: dict[str, Any]) -> str:
+    """
+    Which PERSON needs attention, on a case carrying two of them.
+
+    WHY THE CASE-LEVEL SENTENCE IS NOT ENOUGH. KYC is scoped per party,
+    so a case-level roll-up says "KYC REVIEW: name differs across
+    rpan.jpg, dl1.jpg; name differs across lpan.jpg, dl2.jpg" -- four
+    filenames and no indication that two of them are a different
+    person. A reviewer opening the case has to work out who is who from
+    the filenames before they can act.
+
+    Falls back to the case-level sentence when there is only one party,
+    so a single-applicant summary is exactly what it always was.
+    """
+    per_party = envelope.get("party_kyc") or {}
+    if len(per_party) < 2:
+        return ""
+
+    roles = {
+        str(envelope.get("applicant_id") or ""): "Primary applicant",
+        str(envelope.get("co_applicant_id") or ""): "Co-applicant",
+    }
+
+    clauses = []
+    for party_id, payload in per_party.items():
+        name = roles.get(str(party_id)) or str(party_id)
+        status = str((payload or {}).get("status") or "")
+
+        if not status or status == "SKIPPED":
+            clauses.append(f"{name} KYC was not run")
+        elif status == "PASS":
+            clauses.append(f"{name} KYC passed")
+        else:
+            detail = _reason_phrase(payload.get("reason_codes") or [])
+            verdict = ("requires review" if status == "REVIEW"
+                       else status.lower())
+            clauses.append(f"{name} KYC {verdict}{detail}")
+
+    return " " + ". ".join(clauses) + "."
+
+
+#: How a reason code reads in a sentence. Anything not listed is
+#: rendered from the code itself rather than dropped -- an unnamed
+#: reason is still a reason a reviewer needs.
+_REASON_WORDS = {"DOB": "DOB"}
+
+
+def _reason_phrase(codes: list[Any]) -> str:
+    """
+    ": DOB, father name and name mismatch", or nothing.
+
+    Mismatch codes are collapsed into one list with a single trailing
+    "mismatch", because "DOB mismatch, father name mismatch and name
+    mismatch" says the word three times to no purpose. Codes that are
+    not mismatches keep their own wording.
+    """
+    mismatches: list[str] = []
+    others: list[str] = []
+
+    for code in codes[:4]:
+        text = str(code).strip().upper()
+        if text.endswith("_MISMATCH"):
+            stem = text[: -len("_MISMATCH")]
+            mismatches.append(_REASON_WORDS.get(stem,
+                                                stem.replace("_", " ").lower()))
+        else:
+            others.append(text.replace("_", " ").lower())
+
+    parts: list[str] = []
+    if mismatches:
+        parts.append(_and_list(mismatches) + " mismatch")
+    parts.extend(others)
+
+    return f": {_and_list(parts)}" if parts else ""
+
+
+def _and_list(items: list[str]) -> str:
+    """a, b and c."""
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def deterministic_summary(envelope: dict[str, Any]) -> str:
     """
     A correct one-line summary built from the envelope alone.
@@ -185,7 +268,13 @@ def deterministic_summary(envelope: dict[str, Any]) -> str:
             f"{total} document(s) processed ({breakdown})."
             if breakdown else f"{total} document(s) processed."
         )
-        return (head + _kyc_sentence(envelope.get("kyc"))
+        # PARTY-AWARE WHERE THERE ARE TWO PARTIES. Naming the person
+        # rather than the filenames is what makes the sentence
+        # actionable on a joint application.
+        kyc_sentence = (_party_kyc_sentence(envelope)
+                        or _kyc_sentence(envelope.get("kyc")))
+
+        return (head + kyc_sentence
                 + f" Overall {envelope.get('status', 'UNKNOWN')}.").strip()
 
     return (_document_sentence(envelope) + _kyc_sentence(envelope.get("kyc"))).strip()
@@ -329,7 +418,71 @@ def validate_llm_summary(
         if re.search(rf"\b{verdict}\b", upper) and verdict not in computed:
             return False, f"summary asserted an uncomputed verdict: {verdict}"
 
+    # ON A JOINT APPLICATION THE SENTENCE MUST SAY WHOSE.
+    #
+    # Everything above checks that the model did not INVENT anything. It
+    # cannot check that the model said enough, and on a two-party case
+    # "enough" is a contract requirement rather than a nicety: a reviewer
+    # has to know WHICH of two people needs attention before they can do
+    # anything. The model wrote "Loan officer review shows all documents
+    # except Kyc status as successful, with multiple Kyc reason codes
+    # noted" -- true, harmless, and useless for that.
+    #
+    # The deterministic sentence always says whose, so the bar here is
+    # simply that a generated one must too. A model that learns to name
+    # both parties and their outcomes is still allowed to win.
+    missing = _unnamed_parties(cleaned, envelope)
+    if missing:
+        return False, f"summary did not identify: {', '.join(missing)}"
+
     return True, cleaned
+
+
+#: How each party is named in a sentence a reviewer reads.
+_PARTY_WORDS = {
+    "applicant_id": ("primary applicant", "applicant"),
+    "co_applicant_id": ("co-applicant", "coapplicant", "co applicant"),
+}
+
+
+def _unnamed_parties(text: str, envelope: dict[str, Any]) -> list[str]:
+    """
+    Which parties a generated summary failed to account for.
+
+    Empty on a single-applicant case: there is only one person, the
+    existing deterministic sentence never named them either, and
+    requiring it would reject every summary that works today.
+
+    A party is accounted for when the sentence names them AND states an
+    outcome for them -- naming somebody and saying nothing about them is
+    the same omission in a longer sentence.
+    """
+    per_party = envelope.get("party_kyc") or {}
+    if len(per_party) < 2:
+        return []
+
+    lowered = text.lower()
+    missing: list[str] = []
+
+    for field, words in _PARTY_WORDS.items():
+        if not envelope.get(field):
+            continue
+        named = any(word in lowered for word in words)
+        if not named:
+            missing.append(words[0])
+
+    # An outcome word has to appear for each party, not once overall.
+    if not missing and len(_OUTCOME_WORD.findall(lowered)) < len(per_party):
+        missing.append("an outcome for each party")
+
+    return missing
+
+
+#: Words a sentence uses to state a party's KYC outcome.
+_OUTCOME_WORD = re.compile(
+    r"\b(pass(?:ed|es)?|review|requires review|fail(?:ed|s)?|"
+    r"mismatch(?:es)?|skipped|not run|clear(?:ed)?)\b"
+)
 
 
 # THE PROMPT IS A LATENCY CONTROL AS WELL AS AN INSTRUCTION.
